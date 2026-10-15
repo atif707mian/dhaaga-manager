@@ -5206,6 +5206,8 @@ function renderSettings(main){
       <h2>Backup</h2>
       <button class="btn gold" id="bk_run">Run Backup Now</button>
       <div class="settings-note" style="margin:10px 0;">This backs up the entire database (all clients). Backups are stored on the server at <code>${backupSettings?backupSettings.location:'./backups'}</code>.</div>
+      <button class="btn gold" id="bk_source" style="margin-top:4px;">Backup Source Code to GitHub</button>
+      <div class="settings-note" style="margin:10px 0;">This saves the software's own source files (not client data) to the private GitHub repository already connected on this computer.</div>
       <div style="overflow-x:auto;margin-top:10px;">
       <table>
         <thead><tr><th>Date</th><th>Name</th><th>Type</th><th>Status</th><th>Size</th><th></th></tr></thead>
@@ -5436,6 +5438,15 @@ function renderSettings(main){
         showToast('Backup completed');
       }catch(e){ await showAlert(e.message); }
       finally{ btn.disabled = false; btn.textContent = 'Run Backup Now'; }
+    };
+    main.querySelector('#bk_source').onclick = async()=>{
+      const btn = main.querySelector('#bk_source');
+      btn.disabled = true; btn.textContent = 'Backing up...';
+      try{
+        const r = await api('POST','/api/backup/source');
+        showToast(r.committed ? 'Source code backed up to GitHub' : 'Already up to date — nothing changed since the last backup');
+      }catch(e){ await showAlert(e.message); }
+      finally{ btn.disabled = false; btn.textContent = 'Backup Source Code to GitHub'; }
     };
     if(backupSettings){
       main.querySelector('#bs_freq').onchange = ()=>{

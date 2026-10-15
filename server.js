@@ -150,6 +150,32 @@ function runPgDumpToFile(file) {
     child.on('close', (code) => { code === 0 ? resolve() : reject(new Error(stderr || `pg_dump exited with code ${code}`)); });
   });
 }
+const GIT_BIN = process.env.GIT_BIN || 'git';
+function runGit(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(GIT_BIN, args, { cwd: __dirname });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', reject);
+    child.on('close', (code) => { code === 0 ? resolve(stdout) : reject(Object.assign(new Error(stderr || stdout || `git ${args[0]} exited with code ${code}`), { code })); });
+  });
+}
+async function backupSourceCode() {
+  await runGit(['add', '-A']);
+  const stamp = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  let committed = true;
+  try {
+    await runGit(['commit', '-m', `Source backup ${stamp}`]);
+  } catch (err) {
+    // "nothing to commit" is not a failure — it just means no source files
+    // changed since the last backup. Anything else (e.g. no git identity
+    // configured) is a real error and should surface to the user.
+    if (/nothing to commit/i.test(err.message)) { committed = false; } else { throw err; }
+  }
+  await runGit(['push']);
+  return { committed };
+}
 function runPgRestoreFromFile(file) {
   return new Promise((resolve, reject) => {
     const url = new URL(BACKUP_DATABASE_URL);
@@ -3052,6 +3078,15 @@ app.get('/api/backup/history', requireAuth, requireAdmin, async (req, res) => {
   } catch (err) {
     console.error('GET /api/backup/history error:', err);
     res.status(500).json({ error: 'Unable to load backup history' });
+  }
+});
+
+app.post('/api/backup/source', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    res.json(await backupSourceCode());
+  } catch (err) {
+    console.error('POST /api/backup/source error:', err);
+    res.status(500).json({ error: 'Source backup failed: ' + err.message });
   }
 });
 
