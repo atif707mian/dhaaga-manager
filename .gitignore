@@ -1,0 +1,8 @@
+node_modules/
+.env
+backups/
+run-server-forever.log
+data summaries/
+*.dump
+YTS_Processes.xlsx
+.claude/
