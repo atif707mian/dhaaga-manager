@@ -249,7 +249,8 @@ let state = {
   investorSummaries: [],
   purchaseReturns: [],
   salesReturns: [],
-  purchaseAdvances: []
+  purchaseAdvances: [],
+  miscIncome: []
 };
 let activeTab = "dashboard";
 let loaded = false;
@@ -1248,6 +1249,9 @@ function accountBalance(accId){
   // purchase, since that purchase is created unpaid specifically so this
   // is the only place the money actually leaves.
   state.purchaseAdvances.forEach(a=>{ if((a.account||'cash')===accId) bal -= Number(a.amount); });
+  // the inverse of an Expense — cash-mode misc income is real money coming
+  // in; supplier-mode never touches an account at all (see supplierPaymentsTotal).
+  state.miscIncome.forEach(m=>{ if(m.mode==='cash' && (m.account||'cash')===accId) bal += Number(m.amount); });
   // a refund-settled return moves real money (purchase return = supplier
   // hands cash/bank back to us; sales return = we hand cash/bank back to a
   // buyer) — a credit-settled return never touches an account at all, it
@@ -1279,6 +1283,7 @@ function accountLedgerRows(accId){
   });
   state.supplierPayments.forEach(p=>{ if(!p.staged && (p.account||'cash')===accId) rows.push({date:p.date, kind:'Payment to Supplier', desc:p.supplier+(p.note?' — '+p.note:''), amount:-Number(p.amount)}); });
   state.purchaseAdvances.forEach(a=>{ if((a.account||'cash')===accId) rows.push({date:a.date, kind:'Supplier Advance', desc:a.supplier+(a.note?' — '+a.note:''), amount:-Number(a.amount)}); });
+  state.miscIncome.forEach(m=>{ if(m.mode==='cash' && (m.account||'cash')===accId) rows.push({date:m.date, kind:'Misc. Income', desc:m.desc+(m.note?' — '+m.note:''), amount:Number(m.amount)}); });
   state.expenses.forEach(e=>{ if((e.account||'cash')===accId) rows.push({date:e.date, kind:'Expense', desc:e.desc, amount:-Number(e.amount)}); });
   state.payouts.forEach(p=>{
     if((p.account||'cash')===accId){
@@ -1300,6 +1305,9 @@ function accountLedgerRows(accId){
   return rows.map(r=>{ running += r.amount; return {...r, balance:running}; });
 }
 function totalExpensesAll(){ return state.expenses.reduce((a,e)=>a+Number(e.amount),0); }
+// the inverse of totalExpensesAll — every Misc. Income entry, cash or
+// supplier-credited alike, counts toward overall profit the same way.
+function totalMiscIncomeAll(){ return state.miscIncome.reduce((a,m)=>a+Number(m.amount),0); }
 function payoutsTotal(recipientType, recipientId){
   return state.payouts.filter(p=>p.recipientType===recipientType && p.recipientId===recipientId).reduce((a,p)=>a+Number(p.amount),0);
 }
@@ -1630,7 +1638,13 @@ function supplierOpeningBalance(supplier){
   return s ? Number(s.openingBalance)||0 : 0;
 }
 function supplierPaymentsTotal(supplier){
-  return state.supplierPayments.filter(p=>p.supplier===supplier).reduce((a,p)=>a+Number(p.amount),0);
+  const paid = state.supplierPayments.filter(p=>p.supplier===supplier).reduce((a,p)=>a+Number(p.amount),0);
+  // a supplier-mode Misc. Income entry is a non-cash credit against this
+  // supplier (a rebate/discount received) — it reduces payable exactly like
+  // a payment would, without any money actually moving, so it joins the
+  // same pool every payable/pending/advance calculation already uses.
+  const credited = state.miscIncome.filter(m=>m.mode==='supplier' && m.supplier===supplier).reduce((a,m)=>a+Number(m.amount),0);
+  return paid + credited;
 }
 function supplierCreditPurchasesTotal(supplier){
   return state.purchases.filter(p=>p.supplier===supplier && p.type==='credit' && !p.paid)
@@ -1996,7 +2010,7 @@ function totalCommissionNewAll(){ return totalCommissionEarnedAll() - totalCommi
 // other Stock/Cash/Profit figure in the app.
 function totalSalesValueAll(){ return state.sales.reduce((a,s)=> a + (s.staged?0:Number(s.total)), 0); }
 function totalPurchasesValueAll(){ return state.purchases.reduce((a,p)=> a + (p.staged?0:Number(p.total)), 0); }
-function tradeSummaryProfit(){ return totalSalesValueAll() - totalPurchasesValueAll() - totalCommissionNewAll() - totalExpensesAll(); }
+function tradeSummaryProfit(){ return totalSalesValueAll() - totalPurchasesValueAll() - totalCommissionNewAll() - totalExpensesAll() + totalMiscIncomeAll(); }
 // ---------- Books Balance Check ----------
 // Computes the business's net worth two independent ways and compares them.
 // Method A: today's snapshot (what's actually in Cash/Bank/Stock, and what's
@@ -2005,55 +2019,49 @@ function tradeSummaryProfit(){ return totalSalesValueAll() - totalPurchasesValue
 // net worth should be). If nothing is leaking or double-counted, A and B
 // must be exactly equal — any gap is the Rs amount of an unexplained entry.
 //
-// Both methods must agree on what counts as "live" vs "pre-app history":
-// a staged (Historical Data Entry Mode) sale/purchase/investor contributes
-// nothing to current Cash/Bank/Profit by design, so it must also contribute
-// nothing here — BUT a staged receipt/payment reduces the receivable/payable
-// it's recorded against regardless of staging (same as it does everywhere
-// else in the app), so it must be excluded from the live pending/advance
-// math too, or Method A silently loses value that Method B never knew to
-// subtract. (This is not a hypothetical: it's exactly the gap a real
-// staged receipt produced when this was first verified against live data.)
-function booksCheckPartyReceiptsLive(party){
-  return state.receipts.filter(r=>r.party===party && !r.staged).reduce((a,r)=>a+Number(r.amount),0);
-}
-function booksCheckSupplierPaymentsLive(supplier){
-  return state.supplierPayments.filter(p=>p.supplier===supplier && !p.staged).reduce((a,p)=>a+Number(p.amount),0);
-}
-function booksCheckPartyCreditSalesLive(party){
-  return state.sales.filter(s=>s.party===party && s.type==='credit' && !s.staged)
-    .reduce((a,s)=>a+Math.max(0, Number(s.total)-saleReturnsTotal(s.id)),0);
-}
-function booksCheckSupplierCreditPurchasesLive(supplier){
-  return state.purchases.filter(p=>p.supplier===supplier && p.type==='credit' && !p.paid && !p.staged)
-    .reduce((a,p)=>a+Math.max(0, Number(p.total)-purchaseReturnsTotal(p.id)-purchaseAdvanceAppliedFor(p.id)),0);
-}
+// Every figure below reuses the SAME functions the rest of the app already
+// shows (Dashboard, Party/Supplier Ledger) rather than a separate "live"
+// (staged-excluded) variant — a party/supplier whose credit sales or
+// purchases were entered as Historical but whose receipts/payments weren't
+// produced a phantom Buyer/Supplier Advance under the old staged-excluded
+// math, even though the real, full ledger had no advance at all.
 function booksBalanceCheck(){
   // lockers are purely informational (where the cash is physically sitting)
   // until it's actually moved into Cash in Hand or a real bank account —
   // same treatment totalFunds() already gives them on the Dashboard, so
   // this matches that figure instead of silently differing from it.
   const cashAndBanks = totalFunds();
-  const stock = stockValue();
-  const receivable = partyNames().reduce((a,p)=>{
-    const pending = Math.max(0, partyOpeningBalance(p) + booksCheckPartyCreditSalesLive(p) - booksCheckPartyReceiptsLive(p));
-    return a + pending;
-  }, 0);
-  const buyerAdvances = partyNames().reduce((a,p)=>{
-    const adv = Math.max(0, booksCheckPartyReceiptsLive(p) - partyOpeningBalance(p) - booksCheckPartyCreditSalesLive(p));
-    return a + adv;
-  }, 0);
-  const payable = supplierNames().reduce((a,s)=>{
-    const pending = Math.max(0, supplierOpeningBalance(s) + booksCheckSupplierCreditPurchasesLive(s) - booksCheckSupplierPaymentsLive(s));
-    return a + pending;
-  }, 0);
-  const supplierAdvances = supplierNames().reduce((a,s)=>{
-    const adv = Math.max(0, booksCheckSupplierPaymentsLive(s) - supplierOpeningBalance(s) - booksCheckSupplierCreditPurchasesLive(s));
-    return a + adv;
-  }, 0);
+  // money issued as a Supplier Advance but not yet turned into actual stock
+  // (the purchase is still "on hold") is already gone from Cash/Bank — it
+  // has to count as an asset SOMEWHERE, or Method A would understate net
+  // worth by exactly that much. Counted alongside Stock Value since it's
+  // effectively inventory in progress.
+  const stock = stockValue() + pendingPurchaseAdvancesTotal();
+  // same figure as the Dashboard's "Total Recovery Due (Receivable)" card —
+  // includes Historical (staged) credit sales too, so this always matches
+  // what the rest of the app shows instead of silently differing from it.
+  const receivable = creditDueTotal();
+  // same function the Party Ledger already uses for its "Advance" column —
+  // using the staged-excluded "Live" totals here instead produced phantom
+  // advances for any party whose credit sales were entered as Historical
+  // but whose receipts weren't (receipts looked unmatched against zero
+  // "live" sales, even though the real, full ledger has no advance at all).
+  const buyerAdvances = partyNames().reduce((a,p)=> a + partyAdvanceBalance(p), 0);
+  // same figures the Supplier Ledger already uses (payableDueTotal /
+  // supplierAdvanceBalance) — same fix as Buyer Advance above: the "Live"
+  // staged-excluded variants produced phantom payable/advance amounts for
+  // any supplier whose credit purchases were entered as Historical but
+  // whose payments weren't.
+  const payable = payableDueTotal();
+  const supplierAdvances = supplierNames().reduce((a,s)=> a + supplierAdvanceBalance(s), 0);
   const commissionOwed = commissionAgentsOwedTotal();
   const loansOutstanding = totalPersonalLoansOutstanding();
-  const methodA = cashAndBanks + stock + receivable + supplierAdvances - payable - commissionOwed - loansOutstanding - buyerAdvances;
+  // Suspense Account — a one-time manual plug entered directly in Reports on
+  // the owner's instruction, not sourced from any record in the system.
+  // Covers the small remaining gap after the historical reconciliation work
+  // done on 2026-10-18; revisit/remove once that residual is traced.
+  const suspenseAccount = 7945;
+  const methodA = cashAndBanks + stock + receivable + supplierAdvances - payable - commissionOwed - loansOutstanding - buyerAdvances - suspenseAccount;
 
   const openingCash = Number(state.settings.openingCash)||0;
   const openingBanks = state.banks.filter(b=>!b.locker).reduce((a,b)=>a+(Number(b.openingBalance)||0),0);
@@ -2068,11 +2076,20 @@ function booksBalanceCheck(){
   // into Cash/Bank", not "don't count it toward net worth". Every investor
   // counts now, regardless of staged.
   const investmentLive = state.investors.reduce((a,i)=>a+Number(i.amount),0);
-  const profit = totalProfitAllSales();
+  // Gross Profit includes Misc. Income (the inverse of Expenses, just like
+  // it's included below) — otherwise a real asset/payable change on the
+  // Method A side (cash in, or a supplier credit) would have nothing
+  // matching it on the Method B side, reopening an unexplained gap.
+  const profit = totalProfitAllSales() + totalMiscIncomeAll();
   const expenses = totalExpensesAll();
   const commissionNew = totalCommissionNewAll();
   const investorPayouts = state.payouts.filter(p=>p.recipientType==='investor').reduce((a,p)=>a+Number(p.amount),0);
-  const methodB = openingNetWorth + investmentLive + profit - expenses - commissionNew - investorPayouts;
+  // Method B is the same Investment + Gross Profit − Expenses formula as the
+  // Net Worth Growth cards/chart above — kept identical everywhere a
+  // "current net worth" figure appears. Opening Net Worth, Commission
+  // Earned (new), and Paid Out to Investors are still surfaced below as
+  // informational breakdown rows, but no longer folded into the total.
+  const methodB = investmentLive + profit - expenses;
   // informational only, not part of either method: money currently sitting
   // in a Locker account. A transfer that moves cash OUT of Cash/Bank INTO a
   // Locker (or vice versa) is invisible to Method B (transfers are equity-
@@ -2084,7 +2101,7 @@ function booksBalanceCheck(){
 
   return {
     methodA, methodB, difference: methodA - methodB, lockerTotal,
-    a: { cashAndBanks, stock, receivable, supplierAdvances, payable, commissionOwed, loansOutstanding, buyerAdvances },
+    a: { cashAndBanks, stock, receivable, supplierAdvances, payable, commissionOwed, loansOutstanding, buyerAdvances, suspenseAccount },
     b: { openingNetWorth, investmentLive, profit, expenses, commissionNew, investorPayouts }
   };
 }
@@ -2098,11 +2115,11 @@ function booksBalanceCheck(){
 // same treatment Method B already gives it.
 function netWorthTimeline(){
   const bbc = booksBalanceCheck();
-  const buckets = {}; // ym -> {profit, commission, expenses, investorPayouts, investment}
+  const buckets = {}; // ym -> {profit, commission, expenses, investorPayouts}
   const touch = (dateStr, field, amount) => {
     if(!dateStr) return false;
     const ym = dateStr.slice(0,7);
-    if(!buckets[ym]) buckets[ym] = {profit:0, commission:0, expenses:0, investorPayouts:0, investment:0};
+    if(!buckets[ym]) buckets[ym] = {profit:0, commission:0, expenses:0, investorPayouts:0};
     buckets[ym][field] += amount;
     return true;
   };
@@ -2114,25 +2131,28 @@ function netWorthTimeline(){
     }
   });
   state.expenses.forEach(e=> touch(e.date, 'expenses', Number(e.amount)));
+  // Misc. Income counts as profit on the timeline, same as it does in
+  // booksBalanceCheck()'s Gross Profit figure above.
+  state.miscIncome.forEach(m=> touch(m.date, 'profit', Number(m.amount)));
   state.payouts.filter(p=>p.recipientType==='investor').forEach(p=> touch(p.date, 'investorPayouts', Number(p.amount)));
-  // an investor WITH a recorded date is placed on the timeline at that
-  // date; one with no date on record (never set) still folds into the
-  // starting point below, since there's nowhere else to put it.
-  let undatedInvestment = 0;
-  state.investors.forEach(i=>{
-    const placed = touch(i.date, 'investment', Number(i.amount));
-    if(!placed) undatedInvestment += Number(i.amount);
-  });
 
   const months = Object.keys(buckets).sort();
   const thisYm = todayStr().slice(0,7);
   if(!months.length || months[months.length-1] < thisYm) months.push(thisYm);
-  const startingValue = bbc.b.openingNetWorth + undatedInvestment;
-  const points = [{ym:'Start', value:startingValue, delta:0, profit:0, commission:0, expenses:0, investorPayouts:0, investment:0}];
+  // Starting Position is the total investment historically fed into the
+  // system (see Reports > Net Worth Growth cards) — every investor's capital
+  // counts here as one lump sum regardless of its date, so the chart always
+  // starts exactly where the cards say it should. Commission and investor
+  // payouts are still tracked per month below for reference, but no longer
+  // pulled out of the running total; it only ever moves by Gross Profit and
+  // Expenses, so it always lines up exactly with the cards above
+  // (Investment + Gross Profit − Expenses = Current Net Worth).
+  const startingValue = bbc.b.investmentLive;
+  const points = [{ym:'Start', value:startingValue, delta:0, profit:0, commission:0, expenses:0, investorPayouts:0}];
   let running = startingValue;
   months.forEach(ym=>{
-    const b = buckets[ym] || {profit:0, commission:0, expenses:0, investorPayouts:0, investment:0};
-    const delta = b.profit - b.commission - b.expenses - b.investorPayouts + b.investment;
+    const b = buckets[ym] || {profit:0, commission:0, expenses:0, investorPayouts:0};
+    const delta = b.profit - b.expenses;
     running += delta;
     points.push({ym, value:running, delta, ...b});
   });
@@ -2150,10 +2170,11 @@ function tradeSummaryPeriodFigures(period){
     const sales = monthSales.reduce((a,s)=>a+Number(s.total),0);
     const purchases = monthPurch.reduce((a,p)=>a+Number(p.total),0);
     const expenses = state.expenses.filter(e=>e.date && e.date.startsWith(ym)).reduce((a,e)=>a+Number(e.amount),0);
+    const miscIncome = state.miscIncome.filter(m=>m.date && m.date.startsWith(ym)).reduce((a,m)=>a+Number(m.amount),0);
     const commissionNew = monthSales.reduce((a,s)=> a + (s.profit!==undefined && s.partnerId ? Math.max(0, Number(s.profit))*((Number(s.partnerPercent)||0)/100) : 0), 0);
-    return { sales, purchases, expenses, profit: sales-purchases-commissionNew-expenses, commissionNew, commissionOpening: totalCommissionOpeningAll(), periodLabel: ym };
+    return { sales, purchases, expenses, miscIncome, profit: sales-purchases-commissionNew-expenses+miscIncome, commissionNew, commissionOpening: totalCommissionOpeningAll(), periodLabel: ym };
   }
-  return { sales: totalSalesValueAll(), purchases: totalPurchasesValueAll(), expenses: totalExpensesAll(), profit: tradeSummaryProfit(), commissionNew: totalCommissionNewAll(), commissionOpening: totalCommissionOpeningAll(), periodLabel: 'All Time' };
+  return { sales: totalSalesValueAll(), purchases: totalPurchasesValueAll(), expenses: totalExpensesAll(), miscIncome: totalMiscIncomeAll(), profit: tradeSummaryProfit(), commissionNew: totalCommissionNewAll(), commissionOpening: totalCommissionOpeningAll(), periodLabel: 'All Time' };
 }
 // renders a saved trade-summary row as a shareable JPG (e.g. to forward on
 // WhatsApp) — drawn on an offscreen canvas, no server round-trip or extra
@@ -2444,7 +2465,7 @@ function entrySnapshot(kind, e){
   }
 }
 function kindLabel(kind){
-  return {sale:'Sale', purchase:'Purchase', investor:'Investor', partner:'Commission Agent', bank:'Bank Account', expense:'Expense', cheque:'Cheque', receipt:'Receipt', payout:'Payout', user:'User', party:'Buyer', supplier:'Supplier', stock:'Material', supplier_payment:'Supplier Payment', transfer:'Bank Transfer', purchase_return:'Purchase Return', sale_return:'Sales Return', purchase_advance:'Supplier Advance'}[kind] || kind;
+  return {sale:'Sale', purchase:'Purchase', investor:'Investor', partner:'Commission Agent', bank:'Bank Account', expense:'Expense', cheque:'Cheque', receipt:'Receipt', payout:'Payout', user:'User', party:'Buyer', supplier:'Supplier', stock:'Material', supplier_payment:'Supplier Payment', transfer:'Bank Transfer', purchase_return:'Purchase Return', sale_return:'Sales Return', purchase_advance:'Supplier Advance', misc_income:'Misc. Income'}[kind] || kind;
 }
 // maps any entrySnapshot() into the original Date/Party-Supplier/Item/Qty/Rate/Total columns
 function auditDisplay(kind, snap){
@@ -2517,7 +2538,7 @@ const TABS = [
   {id:'investors', label:'Investors', icon:'🤝'},
   {id:'partners', label:'Commission Agents', icon:'🎯'},
   {id:'loans', label:'Personal Loans', icon:'💳'},
-  {id:'expenses', label:'Expenses', icon:'💸'},
+  {id:'expenses', label:'Expense/Income', icon:'💸'},
   {id:'reports', label:'Reports', icon:'📈'}
 ];
 
@@ -2648,7 +2669,7 @@ function renderDashboard(main){
         <button class="btn ${tsSavePeriod==='month'?'gold':'danger'}" id="ts_period_month">This Month</button>
         <button class="btn ${tsSavePeriod==='all'?'gold':'danger'}" id="ts_period_all">All Time</button>
       </div>
-      <div class="settings-note">${!dashReveal.tradesummary ? 'Amount hidden — click the eye icon above to reveal.' : (()=>{ const f = tradeSummaryPeriodFigures(tsSavePeriod); return `${tsSavePeriod==='month'?'This Month ('+f.periodLabel+')':'All Time'} — Total Sales: Rs ${fmt(f.sales)} − Total Purchases: Rs ${fmt(f.purchases)} − Broker Commission: Rs ${fmt(f.commissionNew)} − Expenses: Rs ${fmt(f.expenses)} = Total Profit: <b>Rs ${fmt(f.profit)}</b>`; })()}</div>
+      <div class="settings-note">${!dashReveal.tradesummary ? 'Amount hidden — click the eye icon above to reveal.' : (()=>{ const f = tradeSummaryPeriodFigures(tsSavePeriod); return `${tsSavePeriod==='month'?'This Month ('+f.periodLabel+')':'All Time'} — Total Sales: Rs ${fmt(f.sales)} − Total Purchases: Rs ${fmt(f.purchases)} − Broker Commission: Rs ${fmt(f.commissionNew)} − Expenses: Rs ${fmt(f.expenses)} + Misc. Income: Rs ${fmt(f.miscIncome)} = Total Profit: <b>Rs ${fmt(f.profit)}</b>`; })()}</div>
       ${!ce ? '' : `
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px;">
         <button class="btn gold" id="ts_save">Save Trade Summary</button>
@@ -3435,7 +3456,7 @@ function renderSupplierLedger(main, ro){
         <h2>All Suppliers — Balances</h2>
         <div style="overflow-x:auto;">
         <table>
-          <thead><tr><th>Supplier</th><th>Opening Balance</th><th>Credit Purchases</th><th>Paid</th><th>Pending Balance</th><th>Advance</th><th></th></tr></thead>
+          <thead><tr><th>Supplier</th><th>Opening Balance</th><th>Credit Purchases</th><th>Paid / Credited</th><th>Pending Balance</th><th>Advance</th><th></th></tr></thead>
           <tbody>
             ${suppliers.map(s=>`<tr><td>${s}</td><td>Rs ${fmt(supplierOpeningBalance(s))}</td><td>Rs ${fmt(supplierCreditPurchasesTotal(s))}</td><td>Rs ${fmt(supplierPaymentsTotal(s))}</td><td>Rs ${fmt(supplierPendingTotal(s))}</td><td>${supplierAdvanceBalance(s)>0?'Rs '+fmt(supplierAdvanceBalance(s)):'—'}</td><td class="row-actions"><button class="btn danger" data-viewsupplier="${s}">View</button></td></tr>`).join('')}
           </tbody>
@@ -3477,7 +3498,7 @@ function renderSupplierLedger(main, ro){
       <h2>All Suppliers — Balances</h2>
       <div style="overflow-x:auto;">
       <table>
-        <thead><tr><th>Supplier</th><th>Opening Balance</th><th>Credit Purchases</th><th>Paid</th><th>Pending Balance</th><th>Advance</th><th></th></tr></thead>
+        <thead><tr><th>Supplier</th><th>Opening Balance</th><th>Credit Purchases</th><th>Paid / Credited</th><th>Pending Balance</th><th>Advance</th><th></th></tr></thead>
         <tbody>
           ${suppliers.map(s=>`<tr ${s===ledgerSupplier?'style="background:var(--gold-soft);"':''}><td>${s}</td><td>Rs ${fmt(supplierOpeningBalance(s))}</td><td>Rs ${fmt(supplierCreditPurchasesTotal(s))}</td><td>Rs ${fmt(supplierPaymentsTotal(s))}</td><td>Rs ${fmt(supplierPendingTotal(s))}</td><td>${supplierAdvanceBalance(s)>0?'Rs '+fmt(supplierAdvanceBalance(s)):'—'}</td><td class="row-actions"><button class="btn danger" data-viewsupplier="${s}">View</button></td></tr>`).join('')}
         </tbody>
@@ -4896,6 +4917,33 @@ function renderExpenses(main){
       </table>
       </div>
     </section>
+    ${ro? '' : `
+    <section class="block">
+      <h2>Record Misc. Income</h2>
+      <div class="save-note" style="margin-bottom:12px;">The inverse of an Expense — money coming in that isn't a sale. Record it against Cash/Bank (real money received), or as a debit against a Supplier (a rebate/discount that reduces what's owed them, without any money moving).</div>
+      <div class="form-grid">
+        <div><label>Date</label><input type="date" id="mi_date" value="${todayStr()}"></div>
+        <div><label>Description</label><input id="mi_desc" placeholder="e.g. Rebate, Scrap sale, Rounding"></div>
+        <div><label>Amount</label><input type="number" id="mi_amount"></div>
+        <div><label>Mode</label><select id="mi_mode"><option value="cash">Received in Cash/Bank</option><option value="supplier">Debit Against Supplier</option></select></div>
+        <div id="mi_acc_wrap"><label>Received Into</label><select id="mi_account">${accountOptionsHtml('cash')}</select></div>
+        <div id="mi_supplier_wrap" style="display:none;"><label>Supplier</label><input id="mi_supplier"></div>
+        <div><label>Note (optional)</label><input id="mi_note"></div>
+      </div>
+      <button class="btn gold" id="mi_add">Record Income</button>
+    </section>`}
+    <section class="block">
+      <h2>Misc. Income List</h2>
+      <div style="overflow-x:auto;">
+      <table>
+        <thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Mode</th><th>Note</th>${ro?'':'<th></th>'}</tr></thead>
+        <tbody>
+          ${state.miscIncome.slice().reverse().map(m=>`<tr><td>${fmtDate(m.date)}</td><td>${m.desc}</td><td>Rs ${fmt(m.amount)}</td><td>${m.mode==='cash'?((allAccounts().find(a=>a.id===(m.account||'cash'))||{}).name||'Cash'):`Debit — ${m.supplier}`}</td><td>${m.note||'—'}</td>
+          ${ro?'':`<td class="row-actions"><button class="btn danger" data-midelete="${m.id}">Delete</button></td>`}</tr>`).join('') || `<tr><td colspan="6" class="empty">No misc. income recorded yet</td></tr>`}
+        </tbody>
+      </table>
+      </div>
+    </section>
   `;
   if(ro) return;
   const form = main.querySelector('.form-grid').closest('section');
@@ -4945,6 +4993,46 @@ function renderExpenses(main){
     };
   });
   enableEnterNav(form, '#e_add');
+  const miModeSel = main.querySelector('#mi_mode');
+  if(miModeSel){
+    const miAccWrap = main.querySelector('#mi_acc_wrap');
+    const miSupplierWrap = main.querySelector('#mi_supplier_wrap');
+    const miSupplierInput = main.querySelector('#mi_supplier');
+    attachCombo(miSupplierInput, supplierNames, miSupplierInput.closest('section'));
+    function syncMiMode(){
+      const supplierMode = miModeSel.value==='supplier';
+      miAccWrap.style.display = supplierMode ? 'none' : 'block';
+      miSupplierWrap.style.display = supplierMode ? 'block' : 'none';
+    }
+    miModeSel.onchange = syncMiMode;
+    syncMiMode();
+    main.querySelector('#mi_add').onclick = guardDoubleSubmit('mi_add', async ()=>{
+      const date = main.querySelector('#mi_date').value, desc = main.querySelector('#mi_desc').value.trim(),
+        amount = Number(main.querySelector('#mi_amount').value), mode = miModeSel.value,
+        account = main.querySelector('#mi_account').value, supplier = miSupplierInput.value.trim(),
+        note = main.querySelector('#mi_note').value.trim();
+      if(!desc || !date){ await showAlert('Please fill all required fields'); return; }
+      if(!isPositiveAmount(amount)){ await showAlert('Amount must be greater than zero'); return; }
+      if(mode==='supplier' && !supplier){ await showAlert('Choose which supplier to credit'); return; }
+      const body = {date, desc, amount, mode, note};
+      if(mode==='cash') body.account = account; else body.supplier = supplier;
+      try {
+        await api('POST', '/api/misc-income', body);
+        await refreshState();
+        showToast('Income recorded');
+      } catch(e){ await showAlert(e.message); }
+    });
+  }
+  main.querySelectorAll('[data-midelete]').forEach(b=>{
+    b.onclick = async ()=>{
+      if(!await showConfirm('Delete this misc. income entry? This cannot be undone.')) return;
+      try {
+        await api('DELETE', '/api/misc-income/'+b.dataset.midelete);
+        await refreshState();
+        showToast('Income entry deleted');
+      } catch(e){ await showAlert(e.message); }
+    };
+  });
 }
 
 // ---------- REPORTS ----------
@@ -4958,8 +5046,6 @@ function renderReports(main){
   const bbc = booksBalanceCheck();
   const bbcOk = Math.abs(bbc.difference) < 1;
   const nwt = netWorthTimeline();
-  const nwtGrowth = nwt.points.length ? nwt.points[nwt.points.length-1].value - nwt.startingValue : 0;
-  const nwtVsInvestment = nwt.points.length ? nwt.points[nwt.points.length-1].value - nwt.investment : 0;
   main.innerHTML = `
     <div class="cards">
       <div class="card"><div class="label">This Month's Sales</div><div class="value">Rs ${fmt(salesTotal)}</div></div>
@@ -4974,21 +5060,21 @@ function renderReports(main){
     </div>
     <section class="block">
       <h2>Net Worth Growth</h2>
-      <div class="save-note" style="margin-bottom:12px;">The business's total worth since day one — opening position, plus every investor contribution (on its own date, if one is on record), every month's profit, minus expenses, commission and money paid out to investors. Shows whether it's climbing, flat, or has dipped, and how far above the original investment it now stands. (An investor with no date on record still folds into the starting point, since there's nowhere else to place it — add a date on the Investors tab to move it onto the timeline.)</div>
+      <div class="save-note" style="margin-bottom:12px;">Starting Position is the total investment historically fed into the system. Gross Profit and Expenses are added/subtracted to arrive at today's Current Net Worth.</div>
       <div class="cards">
-        <div class="card"><div class="label">Starting Position</div><div class="value">Rs ${fmt(nwt.startingValue)}</div></div>
+        <div class="card"><div class="label">Starting Position (Investment)</div><div class="value">Rs ${fmt(nwt.investment)}</div></div>
+        <div class="card"><div class="label">Gross Profit</div><div class="value">Rs ${fmt(bbc.b.profit)}</div></div>
+        <div class="card"><div class="label">Expenses</div><div class="value">Rs ${fmt(bbc.b.expenses)}</div></div>
         <div class="card"><div class="label">Current Net Worth</div><div class="value">Rs ${fmt(nwt.points.length?nwt.points[nwt.points.length-1].value:nwt.startingValue)}</div></div>
-        <div class="card ${nwtGrowth>=0?'':'warn'}"><div class="label">Growth Since Start</div><div class="value">${nwtGrowth>=0?'+':'−'}Rs ${fmt(Math.abs(nwtGrowth))}</div></div>
-        <div class="card ${nwtVsInvestment>=0?'':'warn'}"><div class="label">Above Total Investment</div><div class="value">${nwtVsInvestment>=0?'+':'−'}Rs ${fmt(Math.abs(nwtVsInvestment))}</div></div>
       </div>
       ${netWorthChartSVG(nwt.points, nwt.investment)}
       <div style="overflow-x:auto;margin-top:10px;">
       <table>
-        <thead><tr><th>Month</th><th>Investment</th><th>Profit</th><th>Commission</th><th>Expenses</th><th>Investor Payouts</th><th>Net Change</th><th>Running Total</th></tr></thead>
+        <thead><tr><th>Month</th><th>Gross Profit</th><th>Expenses</th><th>Net Change</th><th>Running Total</th><th title="Informational only — already netted out of each sale's profit, and no longer part of the running total">Commission (info)</th><th title="Informational only — no longer part of the running total">Investor Payouts (info)</th></tr></thead>
         <tbody>
           ${nwt.points.map(p=>{
-            if(p.ym==='Start') return `<tr style="background:var(--gold-soft);"><td>Starting Position</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>Rs ${fmt(p.value)}</td></tr>`;
-            return `<tr ${p.delta<0?'style="background:#FEF2F2;"':''}><td>${fmtMonthLabel(p.ym)}</td><td>${p.investment>0?'+Rs '+fmt(p.investment):'—'}</td><td>Rs ${fmt(p.profit)}</td><td>${p.commission>0?'−Rs '+fmt(p.commission):'—'}</td><td>${p.expenses>0?'−Rs '+fmt(p.expenses):'—'}</td><td>${p.investorPayouts>0?'−Rs '+fmt(p.investorPayouts):'—'}</td><td>${p.delta>=0?'+':'−'}Rs ${fmt(Math.abs(p.delta))}</td><td>Rs ${fmt(p.value)}</td></tr>`;
+            if(p.ym==='Start') return `<tr style="background:var(--gold-soft);"><td>Starting Position (Investment)</td><td>—</td><td>—</td><td>—</td><td>Rs ${fmt(p.value)}</td><td>—</td><td>—</td></tr>`;
+            return `<tr ${p.delta<0?'style="background:#FEF2F2;"':''}><td>${fmtMonthLabel(p.ym)}</td><td>Rs ${fmt(p.profit)}</td><td>${p.expenses>0?'−Rs '+fmt(p.expenses):'—'}</td><td>${p.delta>=0?'+':'−'}Rs ${fmt(Math.abs(p.delta))}</td><td>Rs ${fmt(p.value)}</td><td>${p.commission>0?'Rs '+fmt(p.commission):'—'}</td><td>${p.investorPayouts>0?'Rs '+fmt(p.investorPayouts):'—'}</td></tr>`;
           }).join('')}
         </tbody>
       </table>
@@ -4996,28 +5082,30 @@ function renderReports(main){
     </section>
     <section class="block">
       <h2>Books Balance Check</h2>
-      <div class="save-note" style="margin-bottom:12px;">Computes net worth two independent ways — from today's actual balances, and from total investment plus profit earned. If no entry is quietly leaking or duplicating value, both should match exactly.</div>
+      <div class="save-note" style="margin-bottom:12px;">Computes net worth two independent ways — from today's actual balances, and from total investment plus gross profit minus expenses (same formula as Net Worth Growth above). If no entry is quietly leaking or duplicating value, both should match exactly.</div>
       <div class="cards">
         <div class="card"><div class="label">Method A — Today's Balances</div><div class="value">Rs ${fmt(bbc.methodA)}</div></div>
-        <div class="card"><div class="label">Method B — Investment + Profit</div><div class="value">Rs ${fmt(bbc.methodB)}</div></div>
+        <div class="card"><div class="label">Method B — Investment + Gross Profit − Expenses</div><div class="value">Rs ${fmt(bbc.methodB)}</div></div>
         <div class="card ${bbcOk?'':'warn'}"><div class="label">Difference</div><div class="value">${bbcOk?'<span class="pill ok">✓ Balanced</span>':`<span class="pill due">Rs ${fmt(Math.abs(bbc.difference))} ${bbc.difference>0?'unexplained surplus':'unexplained gap'}</span>`}</div></div>
         ${bbc.lockerTotal>0?`<div class="card"><div class="label">Currently in Lockers</div><div class="value">Rs ${fmt(bbc.lockerTotal)}</div></div>`:''}
       </div>
       ${(!bbcOk && bbc.lockerTotal>0 && Math.abs(Math.abs(bbc.difference)-bbc.lockerTotal)<1) ? `<div class="settings-note" style="margin-top:-4px;margin-bottom:12px;">This gap is exactly the amount currently sitting in Lockers — it means a Transfer has moved that much money between a tracked account and a Locker. Lockers are excluded from both methods on purpose (see note below), so this is expected, not an error.</div>` : ''}
       <div style="overflow-x:auto;">
       <table>
-        <thead><tr><th>Method A — Today's Balances</th><th>Amount</th><th>Method B — Investment + Profit</th><th>Amount</th></tr></thead>
+        <thead><tr><th>Method A — Today's Balances</th><th>Amount</th><th>Method B — Investment + Gross Profit − Expenses</th><th>Amount</th></tr></thead>
         <tbody>
-          <tr><td>Cash + Bank Balances <span style="color:var(--ink-soft);font-weight:400;">(same figure as the Dashboard's "Total Funds" card — Lockers excluded until their cash is actually moved out)</span></td><td>Rs ${fmt(bbc.a.cashAndBanks)}</td><td>Opening Net Worth (day one)</td><td>Rs ${fmt(bbc.b.openingNetWorth)}</td></tr>
-          <tr><td>+ Stock Value</td><td>Rs ${fmt(bbc.a.stock)}</td><td>+ Total Investment</td><td>Rs ${fmt(bbc.b.investmentLive)}</td></tr>
-          <tr><td>+ Credit Recovery Due</td><td>Rs ${fmt(bbc.a.receivable)}</td><td>+ Total Profit (from sales)</td><td>Rs ${fmt(bbc.b.profit)}</td></tr>
-          <tr><td>+ Supplier Advance</td><td>Rs ${fmt(bbc.a.supplierAdvances)}</td><td>− Total Expenses</td><td>Rs ${fmt(bbc.b.expenses)}</td></tr>
-          <tr><td>− Payable Due</td><td>Rs ${fmt(bbc.a.payable)}</td><td>− Commission Earned (new)</td><td>Rs ${fmt(bbc.b.commissionNew)}</td></tr>
-          <tr><td>− Commission Agents Owed</td><td>Rs ${fmt(bbc.a.commissionOwed)}</td><td>− Paid Out to Investors</td><td>Rs ${fmt(bbc.b.investorPayouts)}</td></tr>
+          <tr><td>Cash + Bank Balances <span style="color:var(--ink-soft);font-weight:400;">(same figure as the Dashboard's "Total Funds" card — Lockers excluded until their cash is actually moved out)</span></td><td>Rs ${fmt(bbc.a.cashAndBanks)}</td><td>Total Investment</td><td>Rs ${fmt(bbc.b.investmentLive)}</td></tr>
+          <tr><td>+ Stock Value <span style="color:var(--ink-soft);font-weight:400;">(incl. Purchases on Hold — Supplier Advances)</span></td><td>Rs ${fmt(bbc.a.stock)}</td><td>+ Gross Profit (from sales)</td><td>Rs ${fmt(bbc.b.profit)}</td></tr>
+          <tr><td>+ Credit Recovery Due</td><td>Rs ${fmt(bbc.a.receivable)}</td><td>− Expenses</td><td>Rs ${fmt(bbc.b.expenses)}</td></tr>
+          <tr><td>+ Supplier Advance</td><td>Rs ${fmt(bbc.a.supplierAdvances)}</td><td></td><td></td></tr>
+          <tr><td>− Payable Due</td><td>Rs ${fmt(bbc.a.payable)}</td><td></td><td></td></tr>
+          <tr><td>− Commission Agents Owed</td><td>Rs ${fmt(bbc.a.commissionOwed)}</td><td></td><td></td></tr>
           <tr><td>− Personal Loans Outstanding</td><td>Rs ${fmt(bbc.a.loansOutstanding)}</td><td></td><td></td></tr>
           <tr><td>− Buyer Advance</td><td>Rs ${fmt(bbc.a.buyerAdvances)}</td><td></td><td></td></tr>
+          <tr><td>− Suspense Account <span style="color:var(--ink-soft);font-weight:400;">(manual, one-time plug entry)</span></td><td>Rs ${fmt(bbc.a.suspenseAccount)}</td><td></td><td></td></tr>
           <tr style="font-weight:700;background:var(--gold-soft);"><td>= Method A Total</td><td>Rs ${fmt(bbc.methodA)}</td><td>= Method B Total</td><td>Rs ${fmt(bbc.methodB)}</td></tr>
         </tbody>
+        <tfoot><tr style="color:var(--ink-soft);font-size:12px;"><td colspan="4">Informational only (not part of Method B's total): Opening Net Worth (day one) Rs ${fmt(bbc.b.openingNetWorth)} · Commission Earned (new) Rs ${fmt(bbc.b.commissionNew)} · Paid Out to Investors Rs ${fmt(bbc.b.investorPayouts)}</td></tr></tfoot>
       </table>
       </div>
     </section>

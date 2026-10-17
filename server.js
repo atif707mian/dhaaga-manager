@@ -692,6 +692,34 @@ async function ensureSchema() {
     );
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS funding_transfer_ids TEXT;
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS funding_loan_ids TEXT;
+    -- misc_income: the inverse of an Expense — money coming IN that isn't a
+    -- sale. Either real cash/bank (mode='cash', adds to account_id) or a
+    -- non-cash credit against a supplier's payable (mode='supplier' — a
+    -- rebate/discount received, reduces what's owed without any money
+    -- actually moving, same principle as a credit-settled Purchase Return
+    -- but not tied to a specific purchase).
+    CREATE TABLE IF NOT EXISTS misc_income (
+      id TEXT PRIMARY KEY,
+      client_id TEXT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+      date DATE NOT NULL,
+      description TEXT NOT NULL,
+      amount NUMERIC(14,2) NOT NULL,
+      mode TEXT NOT NULL CHECK (mode IN ('cash','supplier')),
+      account_id TEXT,
+      supplier TEXT,
+      note TEXT
+    );
+    DO $do12$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'misc_income' AND relrowsecurity) THEN
+        ALTER TABLE misc_income ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE misc_income FORCE ROW LEVEL SECURITY;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'misc_income' AND policyname = 'tenant_isolation') THEN
+        CREATE POLICY tenant_isolation ON misc_income
+          USING (client_id = current_setting('app.current_client_id', true))
+          WITH CHECK (client_id = current_setting('app.current_client_id', true));
+      END IF;
+    END $do12$;
     CREATE TABLE IF NOT EXISTS receipts (
       id TEXT PRIMARY KEY, date DATE NOT NULL, party TEXT NOT NULL,
       amount NUMERIC(14,2) NOT NULL, account_id TEXT NOT NULL DEFAULT 'cash', note TEXT
@@ -716,7 +744,7 @@ async function ensureSchema() {
       before JSONB, after JSONB, entry JSONB
     );
     ALTER TABLE audit_log DROP CONSTRAINT IF EXISTS audit_log_kind_check;
-    ALTER TABLE audit_log ADD CONSTRAINT audit_log_kind_check CHECK (kind IN ('sale','purchase','investor','partner','bank','expense','cheque','receipt','payout','user','party','stock','supplier','supplier_payment','transfer','personal_loan','purchase_return','sale_return','purchase_advance'));
+    ALTER TABLE audit_log ADD CONSTRAINT audit_log_kind_check CHECK (kind IN ('sale','purchase','investor','partner','bank','expense','cheque','receipt','payout','user','party','stock','supplier','supplier_payment','transfer','personal_loan','purchase_return','sale_return','purchase_advance','misc_income'));
 
     -- Phase 1 SaaS prep: add client_id as a NULLABLE column to every business
     -- table. Nullable on purpose — existing rows have no client yet, and this
@@ -762,6 +790,7 @@ const mapPartner = (r) => ({ id: r.id, name: r.name, openingProfit: r.opening_pr
 const mapParty = (r) => ({ id: r.id, name: r.name, openingBalance: r.opening_balance, dueDate: r.due_date });
 const mapSupplier = (r) => ({ id: r.id, name: r.name, openingBalance: r.opening_balance, dueDate: r.due_date });
 const mapExpense = (r) => ({ id: r.id, date: r.date, desc: r.description, amount: r.amount, account: r.account_id, fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids) });
+const mapMiscIncome = (r) => ({ id: r.id, date: r.date, desc: r.description, amount: r.amount, mode: r.mode, account: r.account_id, supplier: r.supplier, note: r.note });
 const mapBank = (r) => ({ id: r.id, name: r.name, openingBalance: r.opening_balance, locker: r.is_locker });
 const mapStock = (r) => ({ id: r.id, name: r.name, qty: r.qty, unit: r.unit, rate: r.rate, avgCost: r.avg_cost, openingQty: r.opening_qty, openingRate: r.opening_rate });
 const mapReceipt = (r) => ({ id: r.id, date: r.date, party: r.party, amount: r.amount, account: r.account_id, note: r.note, staged: r.staged });
@@ -963,6 +992,9 @@ async function computeAccountBalanceDb(db, clientId, accId) {
   // "completed" into a purchase, since that purchase itself is created
   // unpaid (credit) specifically so this is the only place the money leaves.
   sub((await db.query('SELECT amount FROM purchase_advances WHERE client_id=$1 AND account_id=$2', [clientId, accId])).rows, 'amount');
+  // the inverse of the sub() above — cash-mode misc income is real money
+  // coming in; supplier-mode never touches an account at all (see schema).
+  add((await db.query("SELECT amount FROM misc_income WHERE client_id=$1 AND mode='cash' AND account_id=$2", [clientId, accId])).rows, 'amount');
   sub((await db.query('SELECT amount FROM expenses WHERE client_id=$1 AND account_id=$2', [clientId, accId])).rows, 'amount');
   sub((await db.query('SELECT amount FROM payouts WHERE client_id=$1 AND account_id=$2', [clientId, accId])).rows, 'amount');
 
@@ -1026,6 +1058,11 @@ async function supplierPurchaseFifoAppliedDb(db, clientId, supplier, purchaseId)
     'SELECT COALESCE(SUM(amount),0) s FROM supplier_payments WHERE client_id=$1 AND supplier=$2',
     [clientId, supplier]
   );
+  const miscIncomeRes = await db.query(
+    "SELECT COALESCE(SUM(amount),0) s FROM misc_income WHERE client_id=$1 AND mode='supplier' AND supplier=$2",
+    [clientId, supplier]
+  );
+  const paymentsPool = Number(paymentsRes.rows[0].s) + Number(miscIncomeRes.rows[0].s);
   // same principle as the sales side above: a return always shrinks THIS
   // purchase's own effective total first, rather than joining the pool.
   const returnsRes = await db.query(
@@ -1043,7 +1080,7 @@ async function supplierPurchaseFifoAppliedDb(db, clientId, supplier, purchaseId)
     [clientId, supplier]
   );
   const advancesByPurchase = new Map(advancesRes.rows.map((r) => [r.purchase_id, Number(r.s)]));
-  let pool = Number(paymentsRes.rows[0].s);
+  let pool = paymentsPool;
   for (const p of purchasesRes.rows) {
     if (p.type === 'cash' || p.paid) continue;
     const total = Math.max(0, Number(p.total) - (returnsByPurchase.get(p.id) || 0) - (advancesByPurchase.get(p.id) || 0));
@@ -1424,7 +1461,7 @@ app.get('/api/state', requireAuth, resolveActiveClient, requireClientAccess('vie
   try {
     const data = await withTenantDb(req.clientId, async (db) => {
       const cid = req.clientId;
-      const [settings, banks, partners, parties, suppliers, stock, sales, purchases, cheques, investors, expenses, receipts, payouts, auditLog, supplierPayments, transfers, personalLoans, tradeSummaries, investorSummaries, purchaseReturns, salesReturns, purchaseAdvances] = await Promise.all([
+      const [settings, banks, partners, parties, suppliers, stock, sales, purchases, cheques, investors, expenses, receipts, payouts, auditLog, supplierPayments, transfers, personalLoans, tradeSummaries, investorSummaries, purchaseReturns, salesReturns, purchaseAdvances, miscIncome] = await Promise.all([
         db.query('SELECT * FROM settings WHERE client_id = $1', [cid]),
         db.query('SELECT * FROM bank_accounts WHERE client_id = $1 ORDER BY name', [cid]),
         db.query('SELECT * FROM partners WHERE client_id = $1 ORDER BY name', [cid]),
@@ -1446,9 +1483,10 @@ app.get('/api/state', requireAuth, resolveActiveClient, requireClientAccess('vie
         db.query('SELECT * FROM investor_summaries WHERE client_id = $1 ORDER BY created_at DESC', [cid]),
         db.query('SELECT * FROM purchase_returns WHERE client_id = $1 ORDER BY date', [cid]),
         db.query('SELECT * FROM sales_returns WHERE client_id = $1 ORDER BY date', [cid]),
-        db.query('SELECT * FROM purchase_advances WHERE client_id = $1 ORDER BY date', [cid])
+        db.query('SELECT * FROM purchase_advances WHERE client_id = $1 ORDER BY date', [cid]),
+        db.query('SELECT * FROM misc_income WHERE client_id = $1 ORDER BY date', [cid])
       ]);
-      return { settings: settings.rows[0], banks, partners, parties, suppliers, stock, sales, purchases, cheques, investors, expenses, receipts, payouts, auditLog, supplierPayments, transfers, personalLoans, tradeSummaries, investorSummaries, purchaseReturns, salesReturns, purchaseAdvances };
+      return { settings: settings.rows[0], banks, partners, parties, suppliers, stock, sales, purchases, cheques, investors, expenses, receipts, payouts, auditLog, supplierPayments, transfers, personalLoans, tradeSummaries, investorSummaries, purchaseReturns, salesReturns, purchaseAdvances, miscIncome };
     });
     const s = data.settings;
     res.json({
@@ -1485,7 +1523,8 @@ app.get('/api/state', requireAuth, resolveActiveClient, requireClientAccess('vie
       investorSummaries: data.investorSummaries.rows.map(mapInvestorSummary),
       purchaseReturns: data.purchaseReturns.rows.map(mapPurchaseReturn),
       salesReturns: data.salesReturns.rows.map(mapSaleReturn),
-      purchaseAdvances: data.purchaseAdvances.rows.map(mapPurchaseAdvance)
+      purchaseAdvances: data.purchaseAdvances.rows.map(mapPurchaseAdvance),
+      miscIncome: data.miscIncome.rows.map(mapMiscIncome)
     });
   } catch (err) {
     console.error('GET /api/state error:', err);
@@ -2760,6 +2799,47 @@ app.delete('/api/expenses/:id', ...editorAccess, async (req, res) => {
     if (err.code === 'HAS_PAYMENTS') return res.status(400).json({ error: err.message });
     console.error('DELETE /api/expenses/:id error:', err);
     res.status(500).json({ error: 'Unable to delete expense' });
+  }
+});
+
+// ---------- misc income (the inverse of an Expense — see schema comment) ----------
+app.post('/api/misc-income', ...editorAccess, async (req, res) => {
+  const x = req.body || {};
+  if (!x.desc || !x.date || !x.mode) return res.status(400).json({ error: 'Missing required fields' });
+  if (!isPositiveAmount(x.amount)) return res.status(400).json({ error: 'Amount must be greater than zero' });
+  if (!['cash', 'supplier'].includes(x.mode)) return res.status(400).json({ error: 'Mode must be cash or supplier' });
+  if (x.mode === 'supplier' && !x.supplier) return res.status(400).json({ error: 'Choose which supplier to credit' });
+  try {
+    const row = await withTenantDb(req.clientId, async (db) => {
+      const account = x.mode === 'cash' ? (x.account || 'cash') : null;
+      const r = await db.query(
+        'INSERT INTO misc_income (id, client_id, date, description, amount, mode, account_id, supplier, note) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
+        [crypto.randomUUID(), req.clientId, x.date, x.desc, Number(x.amount), x.mode, account, x.mode === 'supplier' ? x.supplier : null, x.note || null]
+      );
+      return r.rows[0];
+    });
+    res.json(mapMiscIncome(row));
+  } catch (err) {
+    console.error('POST /api/misc-income error:', err);
+    res.status(500).json({ error: 'Unable to add misc income' });
+  }
+});
+
+app.delete('/api/misc-income/:id', ...editorAccess, async (req, res) => {
+  try {
+    const found = await withTenantDb(req.clientId, async (db) => {
+      const r = await db.query('SELECT * FROM misc_income WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+      if (!r.rows[0]) return false;
+      const old = r.rows[0];
+      await db.query('DELETE FROM misc_income WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+      await writeAudit(db, req.clientId, 'misc_income', 'delete', { entry: { date: old.date, desc: old.description, amount: old.amount, mode: old.mode, account: old.account_id, supplier: old.supplier } });
+      return true;
+    });
+    if (!found) return res.status(404).json({ error: 'Misc income entry not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('DELETE /api/misc-income/:id error:', err);
+    res.status(500).json({ error: 'Unable to delete misc income' });
   }
 });
 
