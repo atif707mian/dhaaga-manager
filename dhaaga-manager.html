@@ -248,7 +248,8 @@ let state = {
   tradeSummaries: [],
   investorSummaries: [],
   purchaseReturns: [],
-  salesReturns: []
+  salesReturns: [],
+  purchaseAdvances: []
 };
 let activeTab = "dashboard";
 let loaded = false;
@@ -634,6 +635,64 @@ function editPayoutModal({title, recipientLabel, recipients, entry}){
     root.querySelector('#epo_recipient').focus();
   });
 }
+// "Complete Purchase" modal for a Pending Supplier Advance — fills in the
+// yarn details (item/qty/unit/rate) the advance was issued without, and
+// previews how much of the advance will cover the resulting purchase.
+function completeAdvanceModal({advance}){
+  return new Promise((resolve)=>{
+    const root = document.getElementById('modalRoot');
+    root.innerHTML = `<div class="modal-overlay"><div class="modal-box">
+      <h3 style="margin:0 0 14px;">Complete Purchase — ${escapeHtml(advance.supplier)}</h3>
+      <div class="form-grid" style="margin-bottom:0;">
+        <div><label>Yarn Type / Count</label><input id="cam_item" placeholder="e.g. 30s Acrylic / Grey"></div>
+        <div><label>Quantity</label><input type="number" id="cam_qty"></div>
+        <div><label>Unit</label><select id="cam_unit"><option value="bags">Bags</option><option value="kg">KG</option></select></div>
+        <div><label>Rate per Unit</label><input type="number" id="cam_rate"></div>
+      </div>
+      <div class="settings-note" id="cam_preview" style="margin:10px 0;">Advance already issued: Rs ${fmtPlain(advance.amount)}</div>
+      <div class="modal-actions"><button class="btn danger" id="cam_cancel">Cancel</button><button class="btn gold" id="cam_save">Complete Purchase</button></div>
+    </div></div>`;
+    const close = (v)=>{ root.innerHTML=''; document.removeEventListener('keydown', onKey); resolve(v); };
+    const onKey = (e)=>{ if(e.key==='Escape'){ e.preventDefault(); close(null); } };
+    root.querySelector('#cam_cancel').onclick = ()=>close(null);
+    root.querySelector('.modal-overlay').onclick = (e)=>{ if(e.target.classList.contains('modal-overlay')) close(null); };
+    const itemInput = root.querySelector('#cam_item');
+    attachCombo(itemInput, knownVarieties, root.querySelector('.modal-box'));
+    const unitSel = root.querySelector('#cam_unit');
+    function syncUnit(){
+      const name = itemInput.value.trim();
+      const unitsForName = Array.from(new Set(state.stock.filter(x=>x.name===name).map(x=>x.unit)));
+      if(unitsForName.length===1){ unitSel.value = unitsForName[0]; unitSel.disabled = true; } else { unitSel.disabled = false; }
+    }
+    const preview = root.querySelector('#cam_preview');
+    function updatePreview(){
+      syncUnit();
+      const qty = Number(root.querySelector('#cam_qty').value)||0;
+      const rate = Number(root.querySelector('#cam_rate').value)||0;
+      const total = qty*rate;
+      const covered = Math.min(total, Number(advance.amount));
+      const remaining = Math.max(0, total - Number(advance.amount));
+      const leftover = Math.max(0, Number(advance.amount) - total);
+      preview.innerHTML = `Total: Rs ${fmtPlain(total)} — Advance covers Rs ${fmtPlain(covered)}`
+        + (remaining>0.009?`, remaining payable: Rs ${fmtPlain(remaining)}`:'')
+        + (leftover>0.009?`, Rs ${fmtPlain(leftover)} of the advance will be left unused (stays on record against this supplier)`:'');
+    }
+    itemInput.addEventListener('input', updatePreview);
+    root.querySelector('#cam_qty').addEventListener('input', updatePreview);
+    root.querySelector('#cam_rate').addEventListener('input', updatePreview);
+    updatePreview();
+    root.querySelector('#cam_save').onclick = ()=>{
+      const item = itemInput.value.trim();
+      const qty = Number(root.querySelector('#cam_qty').value);
+      const unit = unitSel.value;
+      const rate = Number(root.querySelector('#cam_rate').value);
+      if(!item || !qty || !rate){ showAlert('Please fill all required fields'); return; }
+      close({item, qty, unit, rate});
+    };
+    document.addEventListener('keydown', onKey);
+    itemInput.focus();
+  });
+}
 // edit modal for a Cheque — only ever opened for a still-Pending cheque
 // (the server also enforces this), since a Cleared one already created a
 // real receipt/payment that this wouldn't update.
@@ -1012,6 +1071,18 @@ function enableEnterNav(container, addBtnSelector){
         // while the year segment is still blank). Once the browser considers
         // it a complete, valid date, treat Enter like any other field again.
         if((el.type==='date' || el.type==='time') && !el.value) return;
+        // a plain <select> (e.g. "Paid From") previously skipped straight to
+        // the next field on Enter, never actually opening its own list — the
+        // only way to pick anything other than the default was a mouse
+        // click. First Enter on a fresh arrival now opens the dropdown
+        // itself instead (so arrow keys can browse it); only once it's been
+        // opened does Enter go back to advancing to the next field.
+        if(el.tagName==='SELECT' && !el.dataset.enterOpened){
+          e.preventDefault();
+          el.dataset.enterOpened = '1';
+          if(typeof el.showPicker==='function'){ try{ el.showPicker(); }catch(err){} }
+          return;
+        }
         e.preventDefault();
         if(el.classList.contains('no-skip-empty') && !el.value.trim()) return; // stay put until filled
         // a disabled field (e.g. Unit auto-locked to a material's one known
@@ -1029,6 +1100,8 @@ function enableEnterNav(container, addBtnSelector){
         else if(addBtnSelector){ const b = container.querySelector(addBtnSelector); if(b) b.click(); }
       }
     });
+    // re-arm "first Enter opens the list" for next time focus returns here
+    if(el.tagName==='SELECT') el.addEventListener('blur', ()=>{ delete el.dataset.enterOpened; });
   });
 }
 // text input with a keyboard-navigable suggestion list (variety names etc.)
@@ -1143,6 +1216,13 @@ function allAccounts(){ return [{id:'cash', name:'Cash'}, ...state.banks.map(b=>
 function accountOptionsHtml(selected){
   return allAccounts().map(a=>`<option value="${a.id}" ${a.id===(selected||'cash')?'selected':''}>${a.name} (Rs ${fmtPlain(accountBalance(a.id))})</option>`).join('');
 }
+// Lockers aren't a real "pay from" source for a purchase — the cash has to
+// be moved into Cash/Bank first (a Transfer) before it can actually be
+// spent on buying yarn. Used for Purchases tab's "Paid From" pickers only.
+function nonLockerAccounts(){ return [{id:'cash', name:'Cash'}, ...state.banks.filter(b=>!b.locker).map(b=>({id:b.id, name:b.name}))]; }
+function accountOptionsHtmlNoLocker(selected){
+  return nonLockerAccounts().map(a=>`<option value="${a.id}" ${a.id===(selected||'cash')?'selected':''}>${a.name} (Rs ${fmtPlain(accountBalance(a.id))})</option>`).join('');
+}
 function accountBalance(accId){
   accId = accId || 'cash';
   let bal = accId==='cash' ? Number(state.settings.openingCash||0)
@@ -1163,6 +1243,11 @@ function accountBalance(accId){
     else if(p.type==='credit' && p.paid && (p.account||'cash')===accId) bal -= Number(p.total);
   });
   state.supplierPayments.forEach(p=>{ if(!p.staged && (p.account||'cash')===accId) bal -= Number(p.amount); });
+  // a purchase advance is real money handed to the supplier the moment
+  // it's issued — stays counted even after it's "completed" into a
+  // purchase, since that purchase is created unpaid specifically so this
+  // is the only place the money actually leaves.
+  state.purchaseAdvances.forEach(a=>{ if((a.account||'cash')===accId) bal -= Number(a.amount); });
   // a refund-settled return moves real money (purchase return = supplier
   // hands cash/bank back to us; sales return = we hand cash/bank back to a
   // buyer) — a credit-settled return never touches an account at all, it
@@ -1193,6 +1278,7 @@ function accountLedgerRows(accId){
     else if(p.type==='credit' && p.paid && (p.account||'cash')===accId) rows.push({date:p.date, kind:'Purchase (Paid)', desc:p.supplier+' — '+p.item, amount:-Number(p.total)});
   });
   state.supplierPayments.forEach(p=>{ if(!p.staged && (p.account||'cash')===accId) rows.push({date:p.date, kind:'Payment to Supplier', desc:p.supplier+(p.note?' — '+p.note:''), amount:-Number(p.amount)}); });
+  state.purchaseAdvances.forEach(a=>{ if((a.account||'cash')===accId) rows.push({date:a.date, kind:'Supplier Advance', desc:a.supplier+(a.note?' — '+a.note:''), amount:-Number(a.amount)}); });
   state.expenses.forEach(e=>{ if((e.account||'cash')===accId) rows.push({date:e.date, kind:'Expense', desc:e.desc, amount:-Number(e.amount)}); });
   state.payouts.forEach(p=>{
     if((p.account||'cash')===accId){
@@ -1499,6 +1585,16 @@ function saleReturnsTotal(saleId){
 function purchaseReturnsTotal(purchaseId){
   return state.purchaseReturns.filter(r=>r.purchaseId===purchaseId).reduce((a,r)=>a+Number(r.total),0);
 }
+// a completed Supplier Advance always settles its own linked purchase
+// first — same per-record principle as a return, never pooled, so the
+// money can never land against some other, unrelated purchase.
+function pendingPurchaseAdvancesTotal(){
+  return state.purchaseAdvances.filter(a=>a.status==='open').reduce((a,v)=>a+Number(v.amount),0);
+}
+function purchaseAdvanceAppliedFor(purchaseId){
+  const adv = state.purchaseAdvances.find(a=>a.status==='completed' && a.purchaseId===purchaseId);
+  return adv ? Number(adv.amount) : 0;
+}
 // Historical Data Entry Mode only defers Stock/Cash/Bank/Profit — the party
 // ledger, recoverable/payable totals and their due-date reminders are meant
 // to work immediately for a staged entry too (that's the whole point of
@@ -1538,7 +1634,7 @@ function supplierPaymentsTotal(supplier){
 }
 function supplierCreditPurchasesTotal(supplier){
   return state.purchases.filter(p=>p.supplier===supplier && p.type==='credit' && !p.paid)
-    .reduce((a,p)=>a+Math.max(0, Number(p.total)-purchaseReturnsTotal(p.id)),0);
+    .reduce((a,p)=>a+Math.max(0, Number(p.total)-purchaseReturnsTotal(p.id)-purchaseAdvanceAppliedFor(p.id)),0);
 }
 function supplierPendingTotal(supplier){
   return Math.max(0, supplierOpeningBalance(supplier) + supplierCreditPurchasesTotal(supplier) - supplierPaymentsTotal(supplier));
@@ -1558,7 +1654,7 @@ function supplierLedgerRows(supplier){
     // accountBalance) — a 'credit' settlement is blocked server-side for
     // exactly this case, since shrinking its total here would have no effect.
     if(p.type==='cash' || p.paid){ return {purchase:p, paid:Number(p.total), status:'clear', effectiveTotal:Number(p.total)}; }
-    const total = Math.max(0, Number(p.total) - purchaseReturnsTotal(p.id));
+    const total = Math.max(0, Number(p.total) - purchaseReturnsTotal(p.id) - purchaseAdvanceAppliedFor(p.id));
     const applied = Math.min(pool, total);
     pool -= applied;
     const status = total<=0.009 ? 'clear' : (applied<=0 ? 'pending' : (applied<total ? 'partial' : 'clear'));
@@ -1573,7 +1669,7 @@ function creditPurchaseStatus(purchase){
 function creditPurchaseOutstanding(purchase){
   if(purchase.type!=='credit' || purchase.paid) return 0;
   const row = supplierLedgerRows(purchase.supplier).find(r=>r.purchase.id===purchase.id);
-  return row ? row.effectiveTotal - row.paid : Math.max(0, Number(purchase.total)-purchaseReturnsTotal(purchase.id));
+  return row ? row.effectiveTotal - row.paid : Math.max(0, Number(purchase.total)-purchaseReturnsTotal(purchase.id)-purchaseAdvanceAppliedFor(purchase.id));
 }
 function payableDueTotal(){
   return supplierNames().reduce((a,s)=>a + supplierPendingTotal(s), 0);
@@ -1930,7 +2026,7 @@ function booksCheckPartyCreditSalesLive(party){
 }
 function booksCheckSupplierCreditPurchasesLive(supplier){
   return state.purchases.filter(p=>p.supplier===supplier && p.type==='credit' && !p.paid && !p.staged)
-    .reduce((a,p)=>a+Math.max(0, Number(p.total)-purchaseReturnsTotal(p.id)),0);
+    .reduce((a,p)=>a+Math.max(0, Number(p.total)-purchaseReturnsTotal(p.id)-purchaseAdvanceAppliedFor(p.id)),0);
 }
 function booksBalanceCheck(){
   // lockers are purely informational (where the cash is physically sitting)
@@ -2348,7 +2444,7 @@ function entrySnapshot(kind, e){
   }
 }
 function kindLabel(kind){
-  return {sale:'Sale', purchase:'Purchase', investor:'Investor', partner:'Commission Agent', bank:'Bank Account', expense:'Expense', cheque:'Cheque', receipt:'Receipt', payout:'Payout', user:'User', party:'Buyer', supplier:'Supplier', stock:'Material', supplier_payment:'Supplier Payment', transfer:'Bank Transfer', purchase_return:'Purchase Return', sale_return:'Sales Return'}[kind] || kind;
+  return {sale:'Sale', purchase:'Purchase', investor:'Investor', partner:'Commission Agent', bank:'Bank Account', expense:'Expense', cheque:'Cheque', receipt:'Receipt', payout:'Payout', user:'User', party:'Buyer', supplier:'Supplier', stock:'Material', supplier_payment:'Supplier Payment', transfer:'Bank Transfer', purchase_return:'Purchase Return', sale_return:'Sales Return', purchase_advance:'Supplier Advance'}[kind] || kind;
 }
 // maps any entrySnapshot() into the original Date/Party-Supplier/Item/Qty/Rate/Total columns
 function auditDisplay(kind, snap){
@@ -2539,9 +2635,9 @@ function renderDashboard(main){
       ${amountCardGrouped('Stock Value', stockValue(), false, hideOther)}
       ${amountCardGrouped('Credit Recovery Due', creditDueTotal(), true, hideOther)}
       ${amountCardGrouped('Payable Due (incl. Commission Agents)', payableDueTotal() + commissionAgentsOwedTotal(), true, hideOther)}
-      ${amountCardGrouped('Commission Agents Owed', commissionAgentsOwedTotal(), true, hideOther)}
       ${amountCardGrouped('Personal Loans Outstanding', totalPersonalLoansOutstanding(), true, hideOther)}
       ${amountCardGrouped('Cheques Pending', chequesPendingTotal(), true, hideOther)}
+      ${amountCardGrouped('Purchases on Hold (Supplier Advances)', pendingPurchaseAdvancesTotal(), true, hideOther)}
       ${amountCard('Total Investment', totalInvestment(), 'dash_investment', false, hideInvestment)}
       ${amountCard('Trade Summary (Total Profit)', tradeSummaryProfit(), 'dash_tradesummary', false, !dashReveal.tradesummary)}
     </div>
@@ -3165,15 +3261,15 @@ function renderBuyerLedger(main, ro){
   }
   // no party is pre-selected — the ledger below only appears once one is
   // actively chosen (dropdown or a row's View button), never a default guess.
-  if(ledgerParty && !parties.includes(ledgerParty)) ledgerParty = '';
+  if(ledgerParty && ledgerParty!=='__all__' && !parties.includes(ledgerParty)) ledgerParty = '';
   const partyPicker = `
     <section class="block">
       <h2>Party Ledger</h2>
       <div class="form-grid" style="margin-bottom:0;">
-        <div><label>Party</label><select id="lg_party"><option value="" ${!ledgerParty?'selected':''}>— select a party —</option>${parties.map(p=>`<option value="${p}" ${p===ledgerParty?'selected':''}>${p}</option>`).join('')}</select></div>
+        <div><label>Party</label><select id="lg_party"><option value="" ${!ledgerParty?'selected':''}>— select a party —</option><option value="__all__" ${ledgerParty==='__all__'?'selected':''}>All Parties</option>${parties.map(p=>`<option value="${p}" ${p===ledgerParty?'selected':''}>${p}</option>`).join('')}</select></div>
       </div>
     </section>`;
-  if(!ledgerParty){
+  if(!ledgerParty || ledgerParty==='__all__'){
     main.innerHTML = `
       <section class="block">
         <h2>All Parties — Balances</h2>
@@ -3183,12 +3279,21 @@ function renderBuyerLedger(main, ro){
           <tbody>
             ${parties.map(p=>`<tr><td>${p}</td><td>Rs ${fmt(partyOpeningBalance(p))}</td><td>Rs ${fmt(partyCreditSalesTotal(p))}</td><td>Rs ${fmt(partyReceiptsTotal(p))}</td><td>Rs ${fmt(partyPendingTotal(p))}</td><td>${partyAdvanceBalance(p)>0?'Rs '+fmt(partyAdvanceBalance(p)):'—'}</td><td class="row-actions"><button class="btn danger" data-viewparty="${p}">View</button></td></tr>`).join('')}
           </tbody>
+          <tfoot><tr style="font-weight:700;background:var(--gold-soft);">
+            <td>Total</td>
+            <td>Rs ${fmt(parties.reduce((a,p)=>a+partyOpeningBalance(p),0))}</td>
+            <td>Rs ${fmt(parties.reduce((a,p)=>a+partyCreditSalesTotal(p),0))}</td>
+            <td>Rs ${fmt(parties.reduce((a,p)=>a+partyReceiptsTotal(p),0))}</td>
+            <td>Rs ${fmt(parties.reduce((a,p)=>a+partyPendingTotal(p),0))}</td>
+            <td>Rs ${fmt(parties.reduce((a,p)=>a+partyAdvanceBalance(p),0))}</td>
+            <td></td>
+          </tr></tfoot>
         </table>
         </div>
         <div class="save-note">To add a new buyer's opening balance or edit/remove one, go to <b>Master Record → Buyer</b>.</div>
       </section>
       ${partyPicker}
-      <section class="block"><div class="empty">Select a party above to view their ledger.</div></section>
+      ${ledgerParty==='__all__' ? '' : '<section class="block"><div class="empty">Select a party above to view their ledger.</div></section>'}
     `;
     main.querySelector('#lg_party').onchange = (e)=>{ ledgerParty = e.target.value; render(); };
     main.querySelectorAll('[data-viewparty]').forEach(b=>{
@@ -3211,6 +3316,15 @@ function renderBuyerLedger(main, ro){
         <tbody>
           ${parties.map(p=>`<tr ${p===ledgerParty?'style="background:var(--gold-soft);"':''}><td>${p}</td><td>Rs ${fmt(partyOpeningBalance(p))}</td><td>Rs ${fmt(partyCreditSalesTotal(p))}</td><td>Rs ${fmt(partyReceiptsTotal(p))}</td><td>Rs ${fmt(partyPendingTotal(p))}</td><td>${partyAdvanceBalance(p)>0?'Rs '+fmt(partyAdvanceBalance(p)):'—'}</td><td class="row-actions"><button class="btn danger" data-viewparty="${p}">View</button></td></tr>`).join('')}
         </tbody>
+        <tfoot><tr style="font-weight:700;background:var(--gold-soft);">
+          <td>Total</td>
+          <td>Rs ${fmt(parties.reduce((a,p)=>a+partyOpeningBalance(p),0))}</td>
+          <td>Rs ${fmt(parties.reduce((a,p)=>a+partyCreditSalesTotal(p),0))}</td>
+          <td>Rs ${fmt(parties.reduce((a,p)=>a+partyReceiptsTotal(p),0))}</td>
+          <td>Rs ${fmt(parties.reduce((a,p)=>a+partyPendingTotal(p),0))}</td>
+          <td>Rs ${fmt(parties.reduce((a,p)=>a+partyAdvanceBalance(p),0))}</td>
+          <td></td>
+        </tr></tfoot>
       </table>
       </div>
       <div class="save-note">To add a new buyer's opening balance or edit/remove one, go to <b>Master Record → Buyer</b>.</div>
@@ -3218,7 +3332,7 @@ function renderBuyerLedger(main, ro){
     <section class="block">
       <h2>Party Ledger — ${ledgerParty}</h2>
       <div class="form-grid" style="margin-bottom:0;">
-        <div><label>Party</label><select id="lg_party"><option value="">— select a party —</option>${parties.map(p=>`<option value="${p}" ${p===ledgerParty?'selected':''}>${p}</option>`).join('')}</select></div>
+        <div><label>Party</label><select id="lg_party"><option value="">— select a party —</option><option value="__all__">All Parties</option>${parties.map(p=>`<option value="${p}" ${p===ledgerParty?'selected':''}>${p}</option>`).join('')}</select></div>
       </div>
     </section>
     <div class="cards">
@@ -3314,8 +3428,8 @@ function renderSupplierLedger(main, ro){
     return;
   }
   // no supplier pre-selected — same reasoning as the buyer ledger above.
-  if(ledgerSupplier && !suppliers.includes(ledgerSupplier)) ledgerSupplier = '';
-  if(!ledgerSupplier){
+  if(ledgerSupplier && ledgerSupplier!=='__all__' && !suppliers.includes(ledgerSupplier)) ledgerSupplier = '';
+  if(!ledgerSupplier || ledgerSupplier==='__all__'){
     main.innerHTML = `
       <section class="block">
         <h2>All Suppliers — Balances</h2>
@@ -3325,6 +3439,15 @@ function renderSupplierLedger(main, ro){
           <tbody>
             ${suppliers.map(s=>`<tr><td>${s}</td><td>Rs ${fmt(supplierOpeningBalance(s))}</td><td>Rs ${fmt(supplierCreditPurchasesTotal(s))}</td><td>Rs ${fmt(supplierPaymentsTotal(s))}</td><td>Rs ${fmt(supplierPendingTotal(s))}</td><td>${supplierAdvanceBalance(s)>0?'Rs '+fmt(supplierAdvanceBalance(s)):'—'}</td><td class="row-actions"><button class="btn danger" data-viewsupplier="${s}">View</button></td></tr>`).join('')}
           </tbody>
+          <tfoot><tr style="font-weight:700;background:var(--gold-soft);">
+            <td>Total</td>
+            <td>Rs ${fmt(suppliers.reduce((a,s)=>a+supplierOpeningBalance(s),0))}</td>
+            <td>Rs ${fmt(suppliers.reduce((a,s)=>a+supplierCreditPurchasesTotal(s),0))}</td>
+            <td>Rs ${fmt(suppliers.reduce((a,s)=>a+supplierPaymentsTotal(s),0))}</td>
+            <td>Rs ${fmt(suppliers.reduce((a,s)=>a+supplierPendingTotal(s),0))}</td>
+            <td>Rs ${fmt(suppliers.reduce((a,s)=>a+supplierAdvanceBalance(s),0))}</td>
+            <td></td>
+          </tr></tfoot>
         </table>
         </div>
         <div class="save-note">To add a new supplier's opening balance or edit/remove one, go to <b>Master Record → Supplier</b>.</div>
@@ -3332,10 +3455,10 @@ function renderSupplierLedger(main, ro){
       <section class="block">
         <h2>Supplier Ledger</h2>
         <div class="form-grid" style="margin-bottom:0;">
-          <div><label>Supplier</label><select id="lg_supplier"><option value="" selected>— select a supplier —</option>${suppliers.map(s=>`<option value="${s}">${s}</option>`).join('')}</select></div>
+          <div><label>Supplier</label><select id="lg_supplier"><option value="" ${!ledgerSupplier?'selected':''}>— select a supplier —</option><option value="__all__" ${ledgerSupplier==='__all__'?'selected':''}>All Suppliers</option>${suppliers.map(s=>`<option value="${s}">${s}</option>`).join('')}</select></div>
         </div>
       </section>
-      <section class="block"><div class="empty">Select a supplier above to view their ledger.</div></section>
+      ${ledgerSupplier==='__all__' ? '' : '<section class="block"><div class="empty">Select a supplier above to view their ledger.</div></section>'}
     `;
     main.querySelector('#lg_supplier').onchange = (e)=>{ ledgerSupplier = e.target.value; render(); };
     main.querySelectorAll('[data-viewsupplier]').forEach(b=>{
@@ -3358,6 +3481,15 @@ function renderSupplierLedger(main, ro){
         <tbody>
           ${suppliers.map(s=>`<tr ${s===ledgerSupplier?'style="background:var(--gold-soft);"':''}><td>${s}</td><td>Rs ${fmt(supplierOpeningBalance(s))}</td><td>Rs ${fmt(supplierCreditPurchasesTotal(s))}</td><td>Rs ${fmt(supplierPaymentsTotal(s))}</td><td>Rs ${fmt(supplierPendingTotal(s))}</td><td>${supplierAdvanceBalance(s)>0?'Rs '+fmt(supplierAdvanceBalance(s)):'—'}</td><td class="row-actions"><button class="btn danger" data-viewsupplier="${s}">View</button></td></tr>`).join('')}
         </tbody>
+        <tfoot><tr style="font-weight:700;background:var(--gold-soft);">
+          <td>Total</td>
+          <td>Rs ${fmt(suppliers.reduce((a,s)=>a+supplierOpeningBalance(s),0))}</td>
+          <td>Rs ${fmt(suppliers.reduce((a,s)=>a+supplierCreditPurchasesTotal(s),0))}</td>
+          <td>Rs ${fmt(suppliers.reduce((a,s)=>a+supplierPaymentsTotal(s),0))}</td>
+          <td>Rs ${fmt(suppliers.reduce((a,s)=>a+supplierPendingTotal(s),0))}</td>
+          <td>Rs ${fmt(suppliers.reduce((a,s)=>a+supplierAdvanceBalance(s),0))}</td>
+          <td></td>
+        </tr></tfoot>
       </table>
       </div>
       <div class="save-note">To add a new supplier's opening balance or edit/remove one, go to <b>Master Record → Supplier</b>.</div>
@@ -3365,7 +3497,7 @@ function renderSupplierLedger(main, ro){
     <section class="block">
       <h2>Supplier Ledger — ${ledgerSupplier}</h2>
       <div class="form-grid" style="margin-bottom:0;">
-        <div><label>Supplier</label><select id="lg_supplier"><option value="">— select a supplier —</option>${suppliers.map(s=>`<option value="${s}" ${s===ledgerSupplier?'selected':''}>${s}</option>`).join('')}</select></div>
+        <div><label>Supplier</label><select id="lg_supplier"><option value="">— select a supplier —</option><option value="__all__">All Suppliers</option>${suppliers.map(s=>`<option value="${s}" ${s===ledgerSupplier?'selected':''}>${s}</option>`).join('')}</select></div>
       </div>
     </section>
     <div class="cards">
@@ -3476,7 +3608,7 @@ function renderPurchases(main){
         <div><label>Payment Type</label>
           <select id="p_type"><option value="cash" ${editing&&editing.type==='cash'?'selected':''}>Cash</option><option value="credit" ${editing&&editing.type==='credit'?'selected':''}>Credit (pay later)</option></select>
         </div>
-        <div id="p_acc_wrap" style="display:${editing&&editing.type==='credit'?'none':'block'};"><label>Paid From</label><select id="p_account">${accountOptionsHtml(editing?editing.account:'cash')}</select></div>
+        <div id="p_acc_wrap" style="display:${editing&&editing.type==='credit'?'none':'block'};"><label>Paid From</label><select id="p_account">${accountOptionsHtmlNoLocker(editing?editing.account:'cash')}</select></div>
         <div id="p_cover_wrap" style="display:none;"><label>Cover Shortfall From</label><select id="p_cover_account" class="select-required"></select></div>
         <div id="p_cover_wrap1" style="display:none;"><label>Cover Remaining Shortfall From</label><select id="p_cover_account1" class="select-required"></select></div>
         <div id="p_lender_wrap" style="display:none;"><label>Lender Name</label><input id="p_lender_name" placeholder="e.g. X-Y-Z"></div>
@@ -3495,10 +3627,43 @@ function renderPurchases(main){
             <tr>
               <td>${fmtDate(p.date)}</td><td>${p.supplier}</td><td>${p.item}</td><td>${fmtQty(p.qty)} ${p.unit||'kg'}</td><td>${fmtQty(p.rate)}</td><td>Rs ${fmt(p.total)}</td>
               <td>${p.staged ? '<span class="pill role" title="Entered during Historical Data Entry Mode — permanently excluded from Stock/Cash/Bank/Profit, counts only toward the Supplier Ledger">Historical</span>' : (p.type==='cash' ? '<span class="pill cash">Cash</span>' : (creditPurchaseStatus(p)==='clear'?'<span class="pill ok">Paid</span>':creditPurchaseStatus(p)==='partial'?'<span class="pill partial">Partially Paid</span>':'<span class="pill credit">Payable</span>'))}</td>
-              ${ro?'':`<td class="row-actions">${(!p.staged && p.type==='credit' && creditPurchaseStatus(p)!=='clear') ? `<select class="acc-select" data-paccfor="${p.id}">${accountOptionsHtml('cash')}</select> <button class="btn danger" data-ppaid="${p.id}">Mark Paid</button>` : ''}
+              ${ro?'':`<td class="row-actions">${(!p.staged && p.type==='credit' && creditPurchaseStatus(p)!=='clear') ? `<select class="acc-select" data-paccfor="${p.id}">${accountOptionsHtmlNoLocker('cash')}</select> <button class="btn danger" data-ppaid="${p.id}">Mark Paid</button>` : ''}
                 <button class="btn danger" data-pedit="${p.id}">Edit</button>
                 <button class="btn danger" data-pdelete="${p.id}">Delete</button></td>`}
             </tr>`).join('') || `<tr><td colspan="8" class="empty">No purchases entered yet</td></tr>`}
+        </tbody>
+      </table>
+      </div>
+    </section>
+    ${ro? '' : `
+    <section class="block">
+      <h2>Supplier Advance (Hold for Purchase)</h2>
+      <div class="save-note" style="margin-bottom:12px;">Issue an amount to a supplier before the yarn type, quantity, or rate is known — the money leaves the account now and is held specifically for that purchase. Complete the purchase details later from the list below to resume the same entry.</div>
+      <div class="form-grid">
+        <div><label>Supplier / Mill Name</label><input id="pa_supplier"></div>
+        <div><label>Date</label><input type="date" id="pa_date" value="${todayStr()}"></div>
+        <div><label>Amount</label><input type="number" id="pa_amount"></div>
+        <div id="pa_acc_wrap"><label>Paid From</label><select id="pa_account">${accountOptionsHtmlNoLocker('cash')}</select></div>
+        <div id="pa_cover_wrap" style="display:none;"><label>Cover Shortfall From</label><select id="pa_cover_account" class="select-required"></select></div>
+        <div id="pa_cover_wrap1" style="display:none;"><label>Cover Remaining Shortfall From</label><select id="pa_cover_account1" class="select-required"></select></div>
+        <div id="pa_lender_wrap" style="display:none;"><label>Lender Name</label><input id="pa_lender_name" placeholder="e.g. X-Y-Z"></div>
+        <div><label>Note (optional)</label><input id="pa_note"></div>
+      </div>
+      <div class="settings-note" id="pa_balances_note" style="margin-bottom:12px;"></div>
+      <button class="btn gold" id="pa_add">Issue Advance</button>
+    </section>`}
+    <section class="block">
+      <h2>Pending Supplier Advances</h2>
+      <div style="overflow-x:auto;">
+      <table>
+        <thead><tr><th>Date</th><th>Supplier</th><th>Amount</th><th>Account</th><th>Note</th><th>Status</th>${ro?'':'<th></th>'}</tr></thead>
+        <tbody>
+          ${state.purchaseAdvances.slice().reverse().map(a=>`
+            <tr>
+              <td>${fmtDate(a.date)}</td><td>${a.supplier}</td><td>Rs ${fmt(a.amount)}</td><td>${(allAccounts().find(x=>x.id===a.account)||{}).name||'Cash'}</td><td>${a.note||'—'}</td>
+              <td>${a.status==='open'?'<span class="pill credit">Pending</span>':'<span class="pill ok">Completed</span>'}</td>
+              ${ro?'':`<td class="row-actions">${a.status==='open'?`<button class="btn gold" data-pacomplete="${a.id}">Complete Purchase</button> <button class="btn danger" data-padelete="${a.id}">Cancel</button>`:'—'}</td>`}
+            </tr>`).join('') || `<tr><td colspan="7" class="empty">No supplier advances issued yet</td></tr>`}
         </tbody>
       </table>
       </div>
@@ -3545,6 +3710,8 @@ function renderPurchases(main){
   if(ro) return;
   const form = main.querySelector('.form-grid').closest('section');
   attachCombo(main.querySelector('#p_supplier'), supplierNames, form);
+  const paSupplierInput = main.querySelector('#pa_supplier');
+  if(paSupplierInput) attachCombo(paSupplierInput, supplierNames, paSupplierInput.closest('section'));
   attachCombo(main.querySelector('#p_item'), knownVarieties, form);
   const p_unit = main.querySelector('#p_unit');
   function syncPurchaseUnit(){
@@ -3654,6 +3821,55 @@ function renderPurchases(main){
     };
   });
   enableEnterNav(form, '#p_add');
+  const paAccount = main.querySelector('#pa_account');
+  if(paAccount){
+    function paAvailable(accId){ return accountBalance(accId); }
+    const updatePaFunding = wireShortfallCover(main, 'pa',
+      ()=>paAccount.value,
+      ()=>Number(main.querySelector('#pa_amount').value)||0,
+      paAvailable
+    );
+    paAccount.addEventListener('change', updatePaFunding);
+    main.querySelector('#pa_amount').addEventListener('input', updatePaFunding);
+    main.querySelector('#pa_add').onclick = guardDoubleSubmit('pa_add', async ()=>{
+      const date = main.querySelector('#pa_date').value, supplier = main.querySelector('#pa_supplier').value.trim(),
+        amount = Number(main.querySelector('#pa_amount').value), account = paAccount.value,
+        note = main.querySelector('#pa_note').value.trim();
+      if(!supplier || !date || !amount){ await showAlert('Please fill all required fields'); return; }
+      if(!isPositiveAmount(amount)){ await showAlert('Amount must be greater than zero'); return; }
+      const funding = await resolveShortfallMulti({ date, account, total: amount, getAvailable: paAvailable, prefix:'pa', main });
+      if(!funding) return;
+      const body = {date, supplier, amount, account, note, fundingTransferIds: funding.transferIds, fundingLoanIds: funding.loanIds};
+      try {
+        await api('POST', '/api/purchase-advances', body);
+        await refreshState();
+        showToast('Advance issued');
+      } catch(e){ await showAlert(e.message); }
+    });
+  }
+  main.querySelectorAll('[data-pacomplete]').forEach(b=>{
+    b.onclick = async ()=>{
+      const advance = state.purchaseAdvances.find(a=>a.id===b.dataset.pacomplete);
+      if(!advance) return;
+      const details = await completeAdvanceModal({advance});
+      if(!details) return;
+      try {
+        await api('POST', '/api/purchase-advances/'+advance.id+'/complete', details);
+        await refreshState();
+        showToast('Purchase completed');
+      } catch(e){ await showAlert(e.message); }
+    };
+  });
+  main.querySelectorAll('[data-padelete]').forEach(b=>{
+    b.onclick = async ()=>{
+      if(!await showConfirm('Cancel this advance? The held amount returns to the account.')) return;
+      try {
+        await api('DELETE', '/api/purchase-advances/'+b.dataset.padelete);
+        await refreshState();
+        showToast('Advance cancelled');
+      } catch(e){ await showAlert(e.message); }
+    };
+  });
   const prPurchaseSel = main.querySelector('#pr_purchase');
   if(prPurchaseSel){
     const prSettlementSel = main.querySelector('#pr_settlement');

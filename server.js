@@ -632,6 +632,40 @@ async function ensureSchema() {
           WITH CHECK (client_id = current_setting('app.current_client_id', true));
       END IF;
     END $do10$;
+    -- purchase_advances: money issued to a supplier before the actual yarn
+    -- purchase (qty/rate/item) is known — "held" for that purchase, resumed
+    -- later via POST .../complete which fills in the purchase details and
+    -- creates the real purchases row. The advance amount reduces ONLY that
+    -- specific linked purchase's effective payable (same per-record
+    -- principle as purchase_returns — never generically pooled), so it can
+    -- never be misapplied to an unrelated purchase from the same supplier.
+    -- The advance itself is always counted as a real outflow (the money
+    -- left the account the moment it was issued), regardless of status.
+    CREATE TABLE IF NOT EXISTS purchase_advances (
+      id TEXT PRIMARY KEY,
+      client_id TEXT NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+      date DATE NOT NULL,
+      supplier TEXT NOT NULL,
+      amount NUMERIC(14,2) NOT NULL,
+      account_id TEXT NOT NULL DEFAULT 'cash',
+      note TEXT,
+      status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','completed')),
+      purchase_id TEXT REFERENCES purchases(id) ON DELETE SET NULL,
+      funding_transfer_ids TEXT,
+      funding_loan_ids TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_purchase_advances_purchase ON purchase_advances(purchase_id);
+    DO $do11$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'purchase_advances' AND relrowsecurity) THEN
+        ALTER TABLE purchase_advances ENABLE ROW LEVEL SECURITY;
+        ALTER TABLE purchase_advances FORCE ROW LEVEL SECURITY;
+      END IF;
+      IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE tablename = 'purchase_advances' AND policyname = 'tenant_isolation') THEN
+        CREATE POLICY tenant_isolation ON purchase_advances
+          USING (client_id = current_setting('app.current_client_id', true))
+          WITH CHECK (client_id = current_setting('app.current_client_id', true));
+      END IF;
+    END $do11$;
     CREATE TABLE IF NOT EXISTS cheques (
       id TEXT PRIMARY KEY, date DATE NOT NULL, party TEXT NOT NULL, bank TEXT,
       amount NUMERIC(14,2) NOT NULL, due_date DATE NOT NULL, account_id TEXT NOT NULL DEFAULT 'cash',
@@ -682,7 +716,7 @@ async function ensureSchema() {
       before JSONB, after JSONB, entry JSONB
     );
     ALTER TABLE audit_log DROP CONSTRAINT IF EXISTS audit_log_kind_check;
-    ALTER TABLE audit_log ADD CONSTRAINT audit_log_kind_check CHECK (kind IN ('sale','purchase','investor','partner','bank','expense','cheque','receipt','payout','user','party','stock','supplier','supplier_payment','transfer','personal_loan','purchase_return','sale_return'));
+    ALTER TABLE audit_log ADD CONSTRAINT audit_log_kind_check CHECK (kind IN ('sale','purchase','investor','partner','bank','expense','cheque','receipt','payout','user','party','stock','supplier','supplier_payment','transfer','personal_loan','purchase_return','sale_return','purchase_advance'));
 
     -- Phase 1 SaaS prep: add client_id as a NULLABLE column to every business
     -- table. Nullable on purpose — existing rows have no client yet, and this
@@ -716,6 +750,11 @@ const mapPurchase = (r) => ({
   fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids)
 });
 const mapPurchaseReturn = (r) => ({ id: r.id, date: r.date, purchaseId: r.purchase_id, qty: r.qty, rate: r.rate, total: r.total, settlement: r.settlement, account: r.account_id, note: r.note });
+const mapPurchaseAdvance = (r) => ({
+  id: r.id, date: r.date, supplier: r.supplier, amount: r.amount, account: r.account_id, note: r.note,
+  status: r.status, purchaseId: r.purchase_id,
+  fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids)
+});
 const mapSaleReturn = (r) => ({ id: r.id, date: r.date, saleId: r.sale_id, qty: r.qty, rate: r.rate, total: r.total, settlement: r.settlement, account: r.account_id, note: r.note });
 const mapCheque = (r) => ({ id: r.id, date: r.date, party: r.party, bank: r.bank, amount: r.amount, dueDate: r.due_date, account: r.account_id, status: r.status, receiptId: r.receipt_id, direction: r.direction, paymentId: r.payment_id });
 const mapInvestor = (r) => ({ id: r.id, name: r.name, amount: r.amount, ratio: r.ratio, account: r.account_id, staged: r.staged, date: r.date });
@@ -919,6 +958,11 @@ async function computeAccountBalanceDb(db, clientId, accId) {
   purchases.forEach((r) => { if (r.type === 'cash' || r.paid) bal -= Number(r.total); });
 
   sub((await db.query('SELECT amount FROM supplier_payments WHERE client_id=$1 AND account_id=$2 AND NOT staged', [clientId, accId])).rows, 'amount');
+  // a purchase advance is real money handed to the supplier the moment it's
+  // issued — it keeps counting as an outflow even after it's later
+  // "completed" into a purchase, since that purchase itself is created
+  // unpaid (credit) specifically so this is the only place the money leaves.
+  sub((await db.query('SELECT amount FROM purchase_advances WHERE client_id=$1 AND account_id=$2', [clientId, accId])).rows, 'amount');
   sub((await db.query('SELECT amount FROM expenses WHERE client_id=$1 AND account_id=$2', [clientId, accId])).rows, 'amount');
   sub((await db.query('SELECT amount FROM payouts WHERE client_id=$1 AND account_id=$2', [clientId, accId])).rows, 'amount');
 
@@ -990,10 +1034,19 @@ async function supplierPurchaseFifoAppliedDb(db, clientId, supplier, purchaseId)
     [clientId, supplier]
   );
   const returnsByPurchase = new Map(returnsRes.rows.map((r) => [r.purchase_id, Number(r.s)]));
+  // a completed Purchase Advance always settles its own specific linked
+  // purchase first, same per-record principle as returns — never pooled,
+  // so it can never be misapplied to a different purchase from this supplier.
+  const advancesRes = await db.query(
+    `SELECT purchase_id, COALESCE(SUM(amount),0) s FROM purchase_advances WHERE status='completed' AND purchase_id IN
+     (SELECT id FROM purchases WHERE client_id=$1 AND supplier=$2) GROUP BY purchase_id`,
+    [clientId, supplier]
+  );
+  const advancesByPurchase = new Map(advancesRes.rows.map((r) => [r.purchase_id, Number(r.s)]));
   let pool = Number(paymentsRes.rows[0].s);
   for (const p of purchasesRes.rows) {
     if (p.type === 'cash' || p.paid) continue;
-    const total = Math.max(0, Number(p.total) - (returnsByPurchase.get(p.id) || 0));
+    const total = Math.max(0, Number(p.total) - (returnsByPurchase.get(p.id) || 0) - (advancesByPurchase.get(p.id) || 0));
     const applied = Math.min(pool, total);
     pool -= applied;
     if (p.id === purchaseId) return applied;
@@ -1371,7 +1424,7 @@ app.get('/api/state', requireAuth, resolveActiveClient, requireClientAccess('vie
   try {
     const data = await withTenantDb(req.clientId, async (db) => {
       const cid = req.clientId;
-      const [settings, banks, partners, parties, suppliers, stock, sales, purchases, cheques, investors, expenses, receipts, payouts, auditLog, supplierPayments, transfers, personalLoans, tradeSummaries, investorSummaries, purchaseReturns, salesReturns] = await Promise.all([
+      const [settings, banks, partners, parties, suppliers, stock, sales, purchases, cheques, investors, expenses, receipts, payouts, auditLog, supplierPayments, transfers, personalLoans, tradeSummaries, investorSummaries, purchaseReturns, salesReturns, purchaseAdvances] = await Promise.all([
         db.query('SELECT * FROM settings WHERE client_id = $1', [cid]),
         db.query('SELECT * FROM bank_accounts WHERE client_id = $1 ORDER BY name', [cid]),
         db.query('SELECT * FROM partners WHERE client_id = $1 ORDER BY name', [cid]),
@@ -1392,9 +1445,10 @@ app.get('/api/state', requireAuth, resolveActiveClient, requireClientAccess('vie
         db.query('SELECT * FROM trade_summaries WHERE client_id = $1 ORDER BY created_at DESC', [cid]),
         db.query('SELECT * FROM investor_summaries WHERE client_id = $1 ORDER BY created_at DESC', [cid]),
         db.query('SELECT * FROM purchase_returns WHERE client_id = $1 ORDER BY date', [cid]),
-        db.query('SELECT * FROM sales_returns WHERE client_id = $1 ORDER BY date', [cid])
+        db.query('SELECT * FROM sales_returns WHERE client_id = $1 ORDER BY date', [cid]),
+        db.query('SELECT * FROM purchase_advances WHERE client_id = $1 ORDER BY date', [cid])
       ]);
-      return { settings: settings.rows[0], banks, partners, parties, suppliers, stock, sales, purchases, cheques, investors, expenses, receipts, payouts, auditLog, supplierPayments, transfers, personalLoans, tradeSummaries, investorSummaries, purchaseReturns, salesReturns };
+      return { settings: settings.rows[0], banks, partners, parties, suppliers, stock, sales, purchases, cheques, investors, expenses, receipts, payouts, auditLog, supplierPayments, transfers, personalLoans, tradeSummaries, investorSummaries, purchaseReturns, salesReturns, purchaseAdvances };
     });
     const s = data.settings;
     res.json({
@@ -1430,7 +1484,8 @@ app.get('/api/state', requireAuth, resolveActiveClient, requireClientAccess('vie
       tradeSummaries: data.tradeSummaries.rows.map(mapTradeSummary),
       investorSummaries: data.investorSummaries.rows.map(mapInvestorSummary),
       purchaseReturns: data.purchaseReturns.rows.map(mapPurchaseReturn),
-      salesReturns: data.salesReturns.rows.map(mapSaleReturn)
+      salesReturns: data.salesReturns.rows.map(mapSaleReturn),
+      purchaseAdvances: data.purchaseAdvances.rows.map(mapPurchaseAdvance)
     });
   } catch (err) {
     console.error('GET /api/state error:', err);
@@ -1932,6 +1987,10 @@ app.delete('/api/purchases/:id', ...editorAccess, async (req, res) => {
         }
       }
       await deleteFundingLinks(db, req.clientId, old.funding_transfer_ids, old.funding_loan_ids);
+      // a purchase created via Complete Purchase on a Supplier Advance
+      // carries that advance's money — deleting it must reopen the advance
+      // (not just null the FK) so the money isn't silently lost from view.
+      await db.query("UPDATE purchase_advances SET status='open', purchase_id=NULL WHERE purchase_id=$1 AND client_id=$2", [req.params.id, req.clientId]);
       await db.query('DELETE FROM purchases WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       await recomputeStockItem(db, req.clientId, old.item, old.unit);
       await writeAudit(db, req.clientId, 'purchase', 'delete', {
@@ -2027,6 +2086,92 @@ app.delete('/api/purchase-returns/:id', ...editorAccess, async (req, res) => {
   } catch (err) {
     console.error('DELETE /api/purchase-returns/:id error:', err);
     res.status(500).json({ error: 'Unable to delete purchase return' });
+  }
+});
+
+// ---------- purchase advances (money issued to a supplier before the
+// purchase's qty/rate/item is known — see schema comment above) ----------
+app.post('/api/purchase-advances', ...editorAccess, async (req, res) => {
+  const x = req.body || {};
+  if (!x.supplier || !x.date) return res.status(400).json({ error: 'Missing required fields' });
+  if (!isPositiveAmount(x.amount)) return res.status(400).json({ error: 'Amount must be greater than zero' });
+  try {
+    const row = await withTenantDb(req.clientId, async (db) => {
+      const account = x.account || 'cash';
+      await assertFundsAvailable(db, req.clientId, account, Number(x.amount));
+      const r = await db.query(
+        `INSERT INTO purchase_advances (id, client_id, date, supplier, amount, account_id, note, status, funding_transfer_ids, funding_loan_ids)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,'open',$8,$9) RETURNING *`,
+        [crypto.randomUUID(), req.clientId, x.date, x.supplier, Number(x.amount), account, x.note || null, fundingIdsJson(x.fundingTransferIds), fundingIdsJson(x.fundingLoanIds)]
+      );
+      return r.rows[0];
+    });
+    res.json(mapPurchaseAdvance(row));
+  } catch (err) {
+    if (err.code === 'INSUFFICIENT_FUNDS') return res.status(400).json({ error: err.message });
+    console.error('POST /api/purchase-advances error:', err);
+    res.status(500).json({ error: 'Unable to issue purchase advance' });
+  }
+});
+
+app.post('/api/purchase-advances/:id/complete', ...editorAccess, async (req, res) => {
+  const x = req.body || {};
+  if (!x.item || !x.qty || !x.rate) return res.status(400).json({ error: 'Missing required fields' });
+  if (Number(x.qty) <= 0 || Number(x.rate) <= 0) return res.status(400).json({ error: 'Quantity and rate must be greater than zero' });
+  try {
+    const row = await withTenantDb(req.clientId, async (db) => {
+      const advRow = await db.query('SELECT * FROM purchase_advances WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+      if (!advRow.rows[0]) { const e = new Error('Advance not found'); e.code = 'NOT_FOUND'; throw e; }
+      const adv = advRow.rows[0];
+      if (adv.status !== 'open') { const e = new Error('This advance has already been completed.'); e.code = 'ALREADY_DONE'; throw e; }
+      const unit = x.unit || 'kg';
+      const total = Number(x.qty) * Number(x.rate);
+      // created unpaid (credit) on purpose — the money already left the
+      // account when the advance itself was issued (see
+      // computeAccountBalanceDb); this purchase must never deduct it again.
+      // supplierPurchaseFifoAppliedDb then settles up to the advance amount
+      // against this specific purchase, same as a credit-settled return.
+      const purchaseId = crypto.randomUUID();
+      const pr = await db.query(
+        `INSERT INTO purchases (id, client_id, date, supplier, item, qty, unit, rate, total, type, account_id, paid)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'credit',$10,false) RETURNING *`,
+        [purchaseId, req.clientId, adv.date, adv.supplier, x.item, Number(x.qty), unit, Number(x.rate), total, adv.account_id]
+      );
+      await recomputeStockItem(db, req.clientId, x.item, unit);
+      const updated = await db.query(
+        "UPDATE purchase_advances SET status='completed', purchase_id=$1 WHERE id=$2 AND client_id=$3 RETURNING *",
+        [purchaseId, req.params.id, req.clientId]
+      );
+      return { advance: updated.rows[0], purchase: pr.rows[0] };
+    });
+    res.json({ advance: mapPurchaseAdvance(row.advance), purchase: mapPurchase(row.purchase) });
+  } catch (err) {
+    if (err.code === 'NOT_FOUND') return res.status(404).json({ error: err.message });
+    if (err.code === 'ALREADY_DONE') return res.status(400).json({ error: err.message });
+    console.error('POST /api/purchase-advances/:id/complete error:', err);
+    res.status(500).json({ error: 'Unable to complete purchase' });
+  }
+});
+
+app.delete('/api/purchase-advances/:id', ...editorAccess, async (req, res) => {
+  try {
+    const found = await withTenantDb(req.clientId, async (db) => {
+      const r = await db.query('SELECT * FROM purchase_advances WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+      if (!r.rows[0]) return false;
+      const old = r.rows[0];
+      if (old.status !== 'open') { const e = new Error('This advance has already been completed — delete the linked purchase instead to undo it.'); e.code = 'ALREADY_DONE'; throw e; }
+      await deleteFundingLinks(db, req.clientId, old.funding_transfer_ids, old.funding_loan_ids);
+      await db.query('DELETE FROM purchase_advances WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+      await writeAudit(db, req.clientId, 'purchase_advance', 'delete', { entry: { date: old.date, supplier: old.supplier, amount: old.amount, account: old.account_id } });
+      return true;
+    });
+    if (!found) return res.status(404).json({ error: 'Advance not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.code === 'ALREADY_DONE') return res.status(400).json({ error: err.message });
+    if (err.code === 'HAS_PAYMENTS') return res.status(400).json({ error: err.message });
+    console.error('DELETE /api/purchase-advances/:id error:', err);
+    res.status(500).json({ error: 'Unable to delete advance' });
   }
 });
 
