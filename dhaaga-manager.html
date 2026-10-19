@@ -2014,7 +2014,13 @@ function totalCommissionNewAll(){ return totalCommissionEarnedAll() - totalCommi
 // other Stock/Cash/Profit figure in the app.
 function totalSalesValueAll(){ return state.sales.reduce((a,s)=> a + (s.staged?0:Number(s.total)), 0); }
 function totalPurchasesValueAll(){ return state.purchases.reduce((a,p)=> a + (p.staged?0:Number(p.total)), 0); }
-function tradeSummaryProfit(){ return totalSalesValueAll() - totalPurchasesValueAll() - totalCommissionNewAll() - totalExpensesAll() + totalMiscIncomeAll(); }
+// Gross Profit (sum of each sale's own profit — cost matched to the
+// specific batch actually sold) instead of Total Sales − Total Purchases.
+// The old formula subtracted the FULL cost of everything ever bought, so
+// buying stock that's still sitting unsold (a real asset, shown in Stock
+// Value) made this card look like a loss. Stock no longer affects it at
+// all — a sale's cost only counts here once that sale actually happens.
+function tradeSummaryProfit(){ return totalProfitAllSales() - totalCommissionNewAll() - totalExpensesAll() + totalMiscIncomeAll(); }
 // ---------- Books Balance Check ----------
 // Computes the business's net worth two independent ways and compares them.
 // Method A: today's snapshot (what's actually in Cash/Bank/Stock, and what's
@@ -2176,12 +2182,15 @@ function tradeSummaryPeriodFigures(period){
     const monthPurch = state.purchases.filter(p=>!p.staged && p.date && p.date.startsWith(ym));
     const sales = monthSales.reduce((a,s)=>a+Number(s.total),0);
     const purchases = monthPurch.reduce((a,p)=>a+Number(p.total),0);
+    // Gross Profit from items actually sold this month — not Sales minus
+    // Purchases, same reasoning as tradeSummaryProfit() above.
+    const grossProfit = monthSales.reduce((a,s)=> a + (s.staged || s.profit===undefined ? 0 : Number(s.profit)), 0);
     const expenses = state.expenses.filter(e=>!e.excludeFromProfit && e.date && e.date.startsWith(ym)).reduce((a,e)=>a+Number(e.amount),0);
     const miscIncome = state.miscIncome.filter(m=>!m.excludeFromProfit && m.date && m.date.startsWith(ym)).reduce((a,m)=>a+Number(m.amount),0);
     const commissionNew = monthSales.reduce((a,s)=> a + (s.profit!==undefined && s.partnerId ? Math.max(0, Number(s.profit))*((Number(s.partnerPercent)||0)/100) : 0), 0);
-    return { sales, purchases, expenses, miscIncome, profit: sales-purchases-commissionNew-expenses+miscIncome, commissionNew, commissionOpening: totalCommissionOpeningAll(), periodLabel: ym };
+    return { sales, purchases, grossProfit, expenses, miscIncome, profit: grossProfit-commissionNew-expenses+miscIncome, commissionNew, commissionOpening: totalCommissionOpeningAll(), periodLabel: ym };
   }
-  return { sales: totalSalesValueAll(), purchases: totalPurchasesValueAll(), expenses: totalExpensesAll(), miscIncome: totalMiscIncomeAll(), profit: tradeSummaryProfit(), commissionNew: totalCommissionNewAll(), commissionOpening: totalCommissionOpeningAll(), periodLabel: 'All Time' };
+  return { sales: totalSalesValueAll(), purchases: totalPurchasesValueAll(), grossProfit: totalProfitAllSales(), expenses: totalExpensesAll(), miscIncome: totalMiscIncomeAll(), profit: tradeSummaryProfit(), commissionNew: totalCommissionNewAll(), commissionOpening: totalCommissionOpeningAll(), periodLabel: 'All Time' };
 }
 // renders a saved trade-summary row as a shareable JPG (e.g. to forward on
 // WhatsApp) — drawn on an offscreen canvas, no server round-trip or extra
@@ -2224,8 +2233,14 @@ function drawTradeSummaryCanvas(t){
     y += opts.gap || 38;
   }
 
-  row('Total Sales', 'Rs ' + fmtPlain(t.sales));
-  row('− Total Purchases', 'Rs ' + fmtPlain(t.purchases));
+  if(t.grossProfit!==undefined){
+    row('Gross Profit (items sold)', 'Rs ' + fmtPlain(t.grossProfit));
+  } else {
+    // older saved summaries (before this was switched to Gross Profit) —
+    // still rendered correctly from what they actually stored.
+    row('Total Sales', 'Rs ' + fmtPlain(t.sales));
+    row('− Total Purchases', 'Rs ' + fmtPlain(t.purchases));
+  }
   row('− Broker Commission', 'Rs ' + fmtPlain(t.commissionNew));
   row('− Expenses', 'Rs ' + fmtPlain(t.expenses));
   ctx.strokeStyle = '#d4d4d4';
@@ -2767,7 +2782,7 @@ function renderDashboard(main){
         <button class="btn ${tsSavePeriod==='month'?'gold':'danger'}" id="ts_period_month">This Month</button>
         <button class="btn ${tsSavePeriod==='all'?'gold':'danger'}" id="ts_period_all">All Time</button>
       </div>
-      <div class="settings-note">${!dashReveal.tradesummary ? 'Amount hidden — click the eye icon above to reveal.' : (()=>{ const f = tradeSummaryPeriodFigures(tsSavePeriod); return `${tsSavePeriod==='month'?'This Month ('+f.periodLabel+')':'All Time'} — Total Sales: Rs ${fmt(f.sales)} − Total Purchases: Rs ${fmt(f.purchases)} − Broker Commission: Rs ${fmt(f.commissionNew)} − Expenses: Rs ${fmt(f.expenses)} + Misc. Income: Rs ${fmt(f.miscIncome)} = Total Profit: <b>Rs ${fmt(f.profit)}</b>`; })()}</div>
+      <div class="settings-note">${!dashReveal.tradesummary ? 'Amount hidden — click the eye icon above to reveal.' : (()=>{ const f = tradeSummaryPeriodFigures(tsSavePeriod); return `${tsSavePeriod==='month'?'This Month ('+f.periodLabel+')':'All Time'} — Gross Profit (items sold): Rs ${fmt(f.grossProfit)} − Broker Commission: Rs ${fmt(f.commissionNew)} − Expenses: Rs ${fmt(f.expenses)} + Misc. Income: Rs ${fmt(f.miscIncome)} = Total Profit: <b>Rs ${fmt(f.profit)}</b> <span style="color:var(--ink-soft);">(Total Sales: Rs ${fmt(f.sales)}, Total Purchases: Rs ${fmt(f.purchases)} — for reference only, no longer part of this total)</span>`; })()}</div>
       ${!ce ? '' : `
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px;">
         <button class="btn gold" id="ts_save">Save Trade Summary</button>
@@ -2823,7 +2838,9 @@ function renderDashboard(main){
       try{
         const created = await api('POST','/api/trade-summaries', {date: todayStr(), period: tsSavePeriod, periodLabel: f.periodLabel, sales: f.sales, purchases: f.purchases, commissionNew: f.commissionNew, commissionOpening: f.commissionOpening, expenses: f.expenses, profit: f.profit});
         await refreshState();
-        await downloadTradeSummaryImage(created, dir);
+        // grossProfit isn't a saved DB column (just this one image needs it
+        // right now) — merge it in client-side for the download only.
+        await downloadTradeSummaryImage({...created, grossProfit: f.grossProfit}, dir);
         showToast(dir ? `Trade summary saved to folder "${dir.name}"` : 'Trade summary saved and downloaded');
       }catch(e){ await showAlert(e.message); }
     };
