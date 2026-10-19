@@ -692,6 +692,11 @@ async function ensureSchema() {
     );
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS funding_transfer_ids TEXT;
     ALTER TABLE expenses ADD COLUMN IF NOT EXISTS funding_loan_ids TEXT;
+    -- a one-time historical balance correction (see misc_income below) still
+    -- needs to move real money for the account balance to be right, but it
+    -- isn't real trading performance — this keeps it out of Trade Summary,
+    -- Gross Profit, and Net Worth Growth while still landing in the account.
+    ALTER TABLE expenses ADD COLUMN IF NOT EXISTS exclude_from_profit BOOLEAN NOT NULL DEFAULT FALSE;
     -- misc_income: the inverse of an Expense — money coming IN that isn't a
     -- sale. Either real cash/bank (mode='cash', adds to account_id) or a
     -- non-cash credit against a supplier's payable (mode='supplier' — a
@@ -709,6 +714,7 @@ async function ensureSchema() {
       supplier TEXT,
       note TEXT
     );
+    ALTER TABLE misc_income ADD COLUMN IF NOT EXISTS exclude_from_profit BOOLEAN NOT NULL DEFAULT FALSE;
     DO $do12$ BEGIN
       IF NOT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'misc_income' AND relrowsecurity) THEN
         ALTER TABLE misc_income ENABLE ROW LEVEL SECURITY;
@@ -789,8 +795,8 @@ const mapInvestor = (r) => ({ id: r.id, name: r.name, amount: r.amount, ratio: r
 const mapPartner = (r) => ({ id: r.id, name: r.name, openingProfit: r.opening_profit });
 const mapParty = (r) => ({ id: r.id, name: r.name, openingBalance: r.opening_balance, dueDate: r.due_date });
 const mapSupplier = (r) => ({ id: r.id, name: r.name, openingBalance: r.opening_balance, dueDate: r.due_date });
-const mapExpense = (r) => ({ id: r.id, date: r.date, desc: r.description, amount: r.amount, account: r.account_id, fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids) });
-const mapMiscIncome = (r) => ({ id: r.id, date: r.date, desc: r.description, amount: r.amount, mode: r.mode, account: r.account_id, supplier: r.supplier, note: r.note });
+const mapExpense = (r) => ({ id: r.id, date: r.date, desc: r.description, amount: r.amount, account: r.account_id, fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids), excludeFromProfit: r.exclude_from_profit });
+const mapMiscIncome = (r) => ({ id: r.id, date: r.date, desc: r.description, amount: r.amount, mode: r.mode, account: r.account_id, supplier: r.supplier, note: r.note, excludeFromProfit: r.exclude_from_profit });
 const mapBank = (r) => ({ id: r.id, name: r.name, openingBalance: r.opening_balance, locker: r.is_locker });
 const mapStock = (r) => ({ id: r.id, name: r.name, qty: r.qty, unit: r.unit, rate: r.rate, avgCost: r.avg_cost, openingQty: r.opening_qty, openingRate: r.opening_rate });
 const mapReceipt = (r) => ({ id: r.id, date: r.date, party: r.party, amount: r.amount, account: r.account_id, note: r.note, staged: r.staged });
@@ -2738,8 +2744,8 @@ app.post('/api/expenses', ...editorAccess, async (req, res) => {
     const row = await withTenantDb(req.clientId, async (db) => {
       const account = x.account || 'cash';
       await assertFundsAvailable(db, req.clientId, account, Number(x.amount));
-      return db.query('INSERT INTO expenses (id,client_id,date,description,amount,account_id,funding_transfer_ids,funding_loan_ids) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *',
-        [crypto.randomUUID(), req.clientId, x.date, x.desc, Number(x.amount), account, fundingIdsJson(x.fundingTransferIds), fundingIdsJson(x.fundingLoanIds)]).then((r) => r.rows[0]);
+      return db.query('INSERT INTO expenses (id,client_id,date,description,amount,account_id,funding_transfer_ids,funding_loan_ids,exclude_from_profit) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
+        [crypto.randomUUID(), req.clientId, x.date, x.desc, Number(x.amount), account, fundingIdsJson(x.fundingTransferIds), fundingIdsJson(x.fundingLoanIds), !!x.excludeFromProfit]).then((r) => r.rows[0]);
     });
     res.json(mapExpense(row));
   } catch (err) {
@@ -2758,8 +2764,9 @@ app.patch('/api/expenses/:id', ...editorAccess, async (req, res) => {
       if (!before.rows[0]) return null;
       const old = before.rows[0];
       const newAccount = x.account || 'cash';
-      const r = await db.query('UPDATE expenses SET date=$1, description=$2, amount=$3, account_id=$4 WHERE id=$5 AND client_id=$6 RETURNING *',
-        [x.date, x.desc, Number(x.amount), newAccount, req.params.id, req.clientId]);
+      const newExcludeFromProfit = x.excludeFromProfit !== undefined ? !!x.excludeFromProfit : old.exclude_from_profit;
+      const r = await db.query('UPDATE expenses SET date=$1, description=$2, amount=$3, account_id=$4, exclude_from_profit=$5 WHERE id=$6 AND client_id=$7 RETURNING *',
+        [x.date, x.desc, Number(x.amount), newAccount, newExcludeFromProfit, req.params.id, req.clientId]);
       // QA: no overdraft guard existed on this edit path at all.
       const bal = await computeAccountBalanceDb(db, req.clientId, newAccount);
       if (bal < -0.009) {
@@ -2813,8 +2820,8 @@ app.post('/api/misc-income', ...editorAccess, async (req, res) => {
     const row = await withTenantDb(req.clientId, async (db) => {
       const account = x.mode === 'cash' ? (x.account || 'cash') : null;
       const r = await db.query(
-        'INSERT INTO misc_income (id, client_id, date, description, amount, mode, account_id, supplier, note) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
-        [crypto.randomUUID(), req.clientId, x.date, x.desc, Number(x.amount), x.mode, account, x.mode === 'supplier' ? x.supplier : null, x.note || null]
+        'INSERT INTO misc_income (id, client_id, date, description, amount, mode, account_id, supplier, note, exclude_from_profit) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
+        [crypto.randomUUID(), req.clientId, x.date, x.desc, Number(x.amount), x.mode, account, x.mode === 'supplier' ? x.supplier : null, x.note || null, !!x.excludeFromProfit]
       );
       return r.rows[0];
     });

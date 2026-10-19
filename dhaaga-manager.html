@@ -1304,10 +1304,14 @@ function accountLedgerRows(accId){
   let running = opening;
   return rows.map(r=>{ running += r.amount; return {...r, balance:running}; });
 }
-function totalExpensesAll(){ return state.expenses.reduce((a,e)=>a+Number(e.amount),0); }
+// excludeFromProfit entries (a one-time historical balance correction, not
+// real trading activity) still move real money — see accountBalance() —
+// but are left out of every profit-facing total: Trade Summary, Gross
+// Profit, Net Worth Growth.
+function totalExpensesAll(){ return state.expenses.filter(e=>!e.excludeFromProfit).reduce((a,e)=>a+Number(e.amount),0); }
 // the inverse of totalExpensesAll — every Misc. Income entry, cash or
 // supplier-credited alike, counts toward overall profit the same way.
-function totalMiscIncomeAll(){ return state.miscIncome.reduce((a,m)=>a+Number(m.amount),0); }
+function totalMiscIncomeAll(){ return state.miscIncome.filter(m=>!m.excludeFromProfit).reduce((a,m)=>a+Number(m.amount),0); }
 function payoutsTotal(recipientType, recipientId){
   return state.payouts.filter(p=>p.recipientType===recipientType && p.recipientId===recipientId).reduce((a,p)=>a+Number(p.amount),0);
 }
@@ -2058,9 +2062,11 @@ function booksBalanceCheck(){
   const loansOutstanding = totalPersonalLoansOutstanding();
   // Suspense Account — a one-time manual plug entered directly in Reports on
   // the owner's instruction, not sourced from any record in the system.
-  // Covers the small remaining gap after the historical reconciliation work
-  // done on 2026-10-18; revisit/remove once that residual is traced.
-  const suspenseAccount = 7945;
+  // Covers the small remaining gap after Bismillah Traders' historical
+  // reconciliation work done on 2026-10-18; revisit/remove once that
+  // residual is traced. Scoped to that one client only — it has no meaning
+  // for any other client's books.
+  const suspenseAccount = (session && session.activeClientId === 'f0967ec7-38b7-41fe-8471-e4531162f152') ? 7945 : 0;
   const methodA = cashAndBanks + stock + receivable + supplierAdvances - payable - commissionOwed - loansOutstanding - buyerAdvances - suspenseAccount;
 
   const openingCash = Number(state.settings.openingCash)||0;
@@ -2130,10 +2136,11 @@ function netWorthTimeline(){
       touch(s.date, 'commission', Math.max(0, Number(s.profit)||0) * ((Number(s.partnerPercent)||0)/100));
     }
   });
-  state.expenses.forEach(e=> touch(e.date, 'expenses', Number(e.amount)));
+  state.expenses.filter(e=>!e.excludeFromProfit).forEach(e=> touch(e.date, 'expenses', Number(e.amount)));
   // Misc. Income counts as profit on the timeline, same as it does in
-  // booksBalanceCheck()'s Gross Profit figure above.
-  state.miscIncome.forEach(m=> touch(m.date, 'profit', Number(m.amount)));
+  // booksBalanceCheck()'s Gross Profit figure above — excludeFromProfit
+  // entries (a one-time balance correction) are left out here too.
+  state.miscIncome.filter(m=>!m.excludeFromProfit).forEach(m=> touch(m.date, 'profit', Number(m.amount)));
   state.payouts.filter(p=>p.recipientType==='investor').forEach(p=> touch(p.date, 'investorPayouts', Number(p.amount)));
 
   const months = Object.keys(buckets).sort();
@@ -2169,8 +2176,8 @@ function tradeSummaryPeriodFigures(period){
     const monthPurch = state.purchases.filter(p=>!p.staged && p.date && p.date.startsWith(ym));
     const sales = monthSales.reduce((a,s)=>a+Number(s.total),0);
     const purchases = monthPurch.reduce((a,p)=>a+Number(p.total),0);
-    const expenses = state.expenses.filter(e=>e.date && e.date.startsWith(ym)).reduce((a,e)=>a+Number(e.amount),0);
-    const miscIncome = state.miscIncome.filter(m=>m.date && m.date.startsWith(ym)).reduce((a,m)=>a+Number(m.amount),0);
+    const expenses = state.expenses.filter(e=>!e.excludeFromProfit && e.date && e.date.startsWith(ym)).reduce((a,e)=>a+Number(e.amount),0);
+    const miscIncome = state.miscIncome.filter(m=>!m.excludeFromProfit && m.date && m.date.startsWith(ym)).reduce((a,m)=>a+Number(m.amount),0);
     const commissionNew = monthSales.reduce((a,s)=> a + (s.profit!==undefined && s.partnerId ? Math.max(0, Number(s.profit))*((Number(s.partnerPercent)||0)/100) : 0), 0);
     return { sales, purchases, expenses, miscIncome, profit: sales-purchases-commissionNew-expenses+miscIncome, commissionNew, commissionOpening: totalCommissionOpeningAll(), periodLabel: ym };
   }
@@ -4992,6 +4999,7 @@ function renderExpenses(main){
         <div id="e_cover_wrap1" style="display:none;"><label>Cover Remaining Shortfall From</label><select id="e_cover_account1" class="select-required"></select></div>
         <div id="e_lender_wrap" style="display:none;"><label>Lender Name</label><input id="e_lender_name" placeholder="e.g. X-Y-Z"></div>
       </div>
+      <div style="margin-bottom:12px;"><label><input type="checkbox" id="e_exclude" ${editing&&editing.excludeFromProfit?'checked':''}> One-time balance adjustment — exclude from Trade Summary, Gross Profit &amp; Net Worth Growth (still affects the account balance)</label></div>
       <div class="settings-note" id="e_balances_note" style="margin-bottom:12px;"></div>
       <button class="btn gold" id="e_add">${editing?'Save Changes':'Add Expense'}</button>
       ${editing?'<button class="btn danger" id="e_cancel" style="margin-left:8px;">Cancel Edit</button>':''}
@@ -5002,7 +5010,7 @@ function renderExpenses(main){
       <table>
         <thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Paid From</th>${ro?'':'<th></th>'}</tr></thead>
         <tbody>
-          ${state.expenses.slice().reverse().map(e=>`<tr><td>${fmtDate(e.date)}</td><td>${e.desc}</td><td>Rs ${fmt(e.amount)}</td><td>${(allAccounts().find(a=>a.id===(e.account||'cash'))||{}).name||'Cash'}</td>
+          ${state.expenses.slice().reverse().map(e=>`<tr><td>${fmtDate(e.date)}</td><td>${e.desc}${e.excludeFromProfit?' <span class="pill role" title="Excluded from Trade Summary, Gross Profit and Net Worth Growth">One-time Adjustment</span>':''}</td><td>Rs ${fmt(e.amount)}</td><td>${(allAccounts().find(a=>a.id===(e.account||'cash'))||{}).name||'Cash'}</td>
           ${ro?'':`<td class="row-actions"><button class="btn danger" data-eedit="${e.id}">Edit</button><button class="btn danger" data-edelete="${e.id}">Delete</button></td>`}</tr>`).join('') || `<tr><td colspan="5" class="empty">No expenses entered yet</td></tr>`}
         </tbody>
       </table>
@@ -5021,6 +5029,7 @@ function renderExpenses(main){
         <div id="mi_supplier_wrap" style="display:none;"><label>Supplier</label><input id="mi_supplier"></div>
         <div><label>Note (optional)</label><input id="mi_note"></div>
       </div>
+      <div style="margin-bottom:12px;"><label><input type="checkbox" id="mi_exclude"> One-time balance adjustment — exclude from Trade Summary, Gross Profit &amp; Net Worth Growth (still affects the account balance)</label></div>
       <button class="btn gold" id="mi_add">Record Income</button>
     </section>`}
     <section class="block">
@@ -5029,7 +5038,7 @@ function renderExpenses(main){
       <table>
         <thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Mode</th><th>Note</th>${ro?'':'<th></th>'}</tr></thead>
         <tbody>
-          ${state.miscIncome.slice().reverse().map(m=>`<tr><td>${fmtDate(m.date)}</td><td>${m.desc}</td><td>Rs ${fmt(m.amount)}</td><td>${m.mode==='cash'?((allAccounts().find(a=>a.id===(m.account||'cash'))||{}).name||'Cash'):`Debit — ${m.supplier}`}</td><td>${m.note||'—'}</td>
+          ${state.miscIncome.slice().reverse().map(m=>`<tr><td>${fmtDate(m.date)}</td><td>${m.desc}${m.excludeFromProfit?' <span class="pill role" title="Excluded from Trade Summary, Gross Profit and Net Worth Growth">One-time Adjustment</span>':''}</td><td>Rs ${fmt(m.amount)}</td><td>${m.mode==='cash'?((allAccounts().find(a=>a.id===(m.account||'cash'))||{}).name||'Cash'):`Debit — ${m.supplier}`}</td><td>${m.note||'—'}</td>
           ${ro?'':`<td class="row-actions"><button class="btn danger" data-midelete="${m.id}">Delete</button></td>`}</tr>`).join('') || `<tr><td colspan="6" class="empty">No misc. income recorded yet</td></tr>`}
         </tbody>
       </table>
@@ -5050,17 +5059,18 @@ function renderExpenses(main){
   main.querySelector('#e_account').addEventListener('change', updateExpenseFunding);
   main.querySelector('#e_add').onclick=guardDoubleSubmit('e_add', async()=>{
     const date=main.querySelector('#e_date').value, desc=main.querySelector('#e_desc').value.trim(),
-      amount=Number(main.querySelector('#e_amount').value), account=main.querySelector('#e_account').value;
+      amount=Number(main.querySelector('#e_amount').value), account=main.querySelector('#e_account').value,
+      excludeFromProfit=main.querySelector('#e_exclude').checked;
     if(!desc||!amount){ await showAlert('Enter description and amount'); return; }
     if(!isPositiveAmount(amount)){ await showAlert('Amount must be greater than zero'); return; }
     const funding = await resolveShortfallMulti({ date, account, total: amount, getAvailable: expenseAvailable, prefix:'e', main });
     if(!funding) return;
     try{
       if(editing){
-        await api('PATCH','/api/expenses/'+editing.id, {date, desc, amount, account});
+        await api('PATCH','/api/expenses/'+editing.id, {date, desc, amount, account, excludeFromProfit});
         editingExpenseId = null;
       } else {
-        await api('POST','/api/expenses', {date, desc, amount, account, fundingTransferIds: funding.transferIds, fundingLoanIds: funding.loanIds});
+        await api('POST','/api/expenses', {date, desc, amount, account, excludeFromProfit, fundingTransferIds: funding.transferIds, fundingLoanIds: funding.loanIds});
       }
       await refreshState();
       showToast(editing ? 'Expense updated' : 'Expense added');
@@ -5101,11 +5111,12 @@ function renderExpenses(main){
       const date = main.querySelector('#mi_date').value, desc = main.querySelector('#mi_desc').value.trim(),
         amount = Number(main.querySelector('#mi_amount').value), mode = miModeSel.value,
         account = main.querySelector('#mi_account').value, supplier = miSupplierInput.value.trim(),
-        note = main.querySelector('#mi_note').value.trim();
+        note = main.querySelector('#mi_note').value.trim(),
+        excludeFromProfit = main.querySelector('#mi_exclude').checked;
       if(!desc || !date){ await showAlert('Please fill all required fields'); return; }
       if(!isPositiveAmount(amount)){ await showAlert('Amount must be greater than zero'); return; }
       if(mode==='supplier' && !supplier){ await showAlert('Choose which supplier to credit'); return; }
-      const body = {date, desc, amount, mode, note};
+      const body = {date, desc, amount, mode, note, excludeFromProfit};
       if(mode==='cash') body.account = account; else body.supplier = supplier;
       try {
         await api('POST', '/api/misc-income', body);
