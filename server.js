@@ -574,6 +574,15 @@ async function ensureSchema() {
     -- this purchase can also reverse the money it borrowed to exist.
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS funding_transfer_ids TEXT;
     ALTER TABLE purchases ADD COLUMN IF NOT EXISTS funding_loan_ids TEXT;
+    -- how much of total actually left account_id when this purchase was
+    -- marked paid — NOT always the same as total, since part of it may
+    -- already have been settled by a Return, a completed Purchase Advance,
+    -- or a FIFO-applied Supplier Payment before "Mark Paid" covered the
+    -- rest. NULL for a cash purchase (total always applies) or an unpaid
+    -- credit purchase. Existing paid rows predate this distinction, where
+    -- paid always meant the full total came from one account in one go.
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(14,2);
+    UPDATE purchases SET paid_amount = total WHERE paid = true AND paid_amount IS NULL;
     -- purchase_returns / sales_returns: goods sent back to a supplier or
     -- brought back by a buyer, each tied to the specific purchase/sale it's
     -- returning (same batch-tracking principle sales already use via
@@ -781,6 +790,7 @@ const mapSale = (r) => ({
 const mapPurchase = (r) => ({
   id: r.id, date: r.date, supplier: r.supplier, item: r.item, qty: r.qty, unit: r.unit,
   rate: r.rate, total: r.total, type: r.type, account: r.account_id, paid: r.paid, staged: r.staged,
+  paidAmount: r.paid_amount,
   fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids)
 });
 const mapPurchaseReturn = (r) => ({ id: r.id, date: r.date, purchaseId: r.purchase_id, qty: r.qty, rate: r.rate, total: r.total, settlement: r.settlement, account: r.account_id, note: r.note });
@@ -989,8 +999,11 @@ async function computeAccountBalanceDb(db, clientId, accId) {
   add((await db.query("SELECT total AS amount FROM purchase_returns WHERE client_id=$1 AND account_id=$2 AND settlement='refund'", [clientId, accId])).rows, 'amount');
   sub((await db.query("SELECT total AS amount FROM sales_returns WHERE client_id=$1 AND account_id=$2 AND settlement='refund'", [clientId, accId])).rows, 'amount');
 
-  const purchases = (await db.query("SELECT total, type, paid FROM purchases WHERE client_id=$1 AND account_id=$2 AND NOT staged", [clientId, accId])).rows;
-  purchases.forEach((r) => { if (r.type === 'cash' || r.paid) bal -= Number(r.total); });
+  const purchases = (await db.query("SELECT total, type, paid, paid_amount FROM purchases WHERE client_id=$1 AND account_id=$2 AND NOT staged", [clientId, accId])).rows;
+  purchases.forEach((r) => {
+    if (r.type === 'cash') bal -= Number(r.total);
+    else if (r.paid) bal -= Number(r.paid_amount != null ? r.paid_amount : r.total);
+  });
 
   sub((await db.query('SELECT amount FROM supplier_payments WHERE client_id=$1 AND account_id=$2 AND NOT staged', [clientId, accId])).rows, 'amount');
   // a purchase advance is real money handed to the supplier the moment it's
@@ -1996,16 +2009,41 @@ app.post('/api/purchases/:id/mark-paid', ...editorAccess, async (req, res) => {
   const x = req.body || {};
   try {
     const row = await withTenantDb(req.clientId, async (db) => {
-      const existing = await db.query("SELECT total FROM purchases WHERE id=$1 AND client_id=$2 AND type='credit' AND NOT staged", [req.params.id, req.clientId]);
+      const existing = await db.query("SELECT * FROM purchases WHERE id=$1 AND client_id=$2 AND type='credit' AND NOT staged", [req.params.id, req.clientId]);
       if (!existing.rows[0]) return null;
-      await assertFundsAvailable(db, req.clientId, x.account || 'cash', Number(existing.rows[0].total));
-      const r = await db.query("UPDATE purchases SET paid=true, account_id=$1 WHERE id=$2 AND client_id=$3 AND type='credit' AND NOT staged RETURNING *",
-        [x.account || 'cash', req.params.id, req.clientId]);
+      const purchase = existing.rows[0];
+      // Already fully paid — reject outright rather than recomputing
+      // "outstanding" from returns/advances/FIFO, which would come back
+      // non-zero (supplierPurchaseFifoAppliedDb skips any already-paid row
+      // entirely) and double-deduct the already-recorded paid_amount.
+      if (purchase.paid) {
+        const e = new Error('This purchase is already fully paid.');
+        e.code = 'ALREADY_SETTLED';
+        throw e;
+      }
+      // Mark Paid only draws whatever is actually still OUTSTANDING from
+      // the chosen account — not the full original total. Part of it may
+      // already be settled by a Return, a completed Purchase Advance, or a
+      // FIFO-applied Supplier Payment; deducting the full total on top of
+      // that would double-count the already-settled portion.
+      const returnsTotal = Number((await db.query('SELECT COALESCE(SUM(total),0) s FROM purchase_returns WHERE purchase_id=$1', [req.params.id])).rows[0].s);
+      const advanceApplied = Number((await db.query("SELECT COALESCE(SUM(amount),0) s FROM purchase_advances WHERE status='completed' AND purchase_id=$1", [req.params.id])).rows[0].s);
+      const fifoApplied = await supplierPurchaseFifoAppliedDb(db, req.clientId, purchase.supplier, req.params.id);
+      const outstanding = Math.max(0, Number(purchase.total) - returnsTotal - advanceApplied - fifoApplied);
+      if (outstanding < 0.009) {
+        const e = new Error('Nothing is left owing on this purchase.');
+        e.code = 'ALREADY_SETTLED';
+        throw e;
+      }
+      await assertFundsAvailable(db, req.clientId, x.account || 'cash', outstanding);
+      const r = await db.query("UPDATE purchases SET paid=true, account_id=$1, paid_amount=$2 WHERE id=$3 AND client_id=$4 AND type='credit' AND NOT staged RETURNING *",
+        [x.account || 'cash', outstanding, req.params.id, req.clientId]);
       return r.rows[0];
     });
     if (!row) return res.status(404).json({ error: 'Purchase not found, or it is still Historical (turn off Historical Data Entry Mode first)' });
     res.json(mapPurchase(row));
   } catch (err) {
+    if (err.code === 'ALREADY_SETTLED') return res.status(400).json({ error: err.message });
     if (err.code === 'INSUFFICIENT_FUNDS') return res.status(400).json({ error: err.message });
     console.error('POST /api/purchases/:id/mark-paid error:', err);
     res.status(500).json({ error: 'Unable to mark purchase paid' });

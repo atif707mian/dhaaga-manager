@@ -22,6 +22,11 @@
     --sidebar-line:rgba(255,255,255,.16);
     --sidebar-text:rgba(255,255,255,.68);
     --sidebar-text-active:#FFFFFF;
+    /* Scales the whole sidebar nav down automatically when there isn't
+       enough vertical room for every tab (see fitSidebarNav()) — 1 is full,
+       comfortable size; JS only ever dials this down, never below the
+       floor baked into each calc() below, so it never gets unreadable. */
+    --nav-scale:1;
   }
   *{box-sizing:border-box;}
   html,body{height:100%;}
@@ -29,30 +34,30 @@
     font-family:'Segoe UI',system-ui,sans-serif;direction:ltr;}
   .app{max-width:none;margin:0;width:100%;min-height:100vh;min-height:100dvh;display:flex;flex-direction:row;}
   .sidebar{width:248px;flex:0 0 248px;background:var(--sidebar-bg);
-    display:flex;flex-direction:column;padding:16px 12px;position:sticky;top:0;align-self:flex-start;
+    display:flex;flex-direction:column;padding:calc(10px*var(--nav-scale)) 12px;position:sticky;top:0;align-self:flex-start;
     height:100vh;height:100dvh;overflow:hidden;}
-  .brand{display:flex;gap:10px;align-items:center;padding:4px 6px 16px;border-bottom:1px solid var(--sidebar-line);margin-bottom:12px;}
-  .brand-icon{width:36px;height:36px;flex:0 0 36px;border-radius:9px;background:var(--sidebar-active-bg);color:var(--sidebar-text-active);
-    display:flex;align-items:center;justify-content:center;font-size:17px;}
+  .brand{display:flex;gap:8px;align-items:center;padding:3px 4px calc(10px*var(--nav-scale));border-bottom:1px solid var(--sidebar-line);margin-bottom:calc(8px*var(--nav-scale));}
+  .brand-icon{width:calc(34px*var(--nav-scale));height:calc(34px*var(--nav-scale));flex:0 0 calc(34px*var(--nav-scale));border-radius:9px;background:var(--sidebar-active-bg);color:var(--sidebar-text-active);
+    display:flex;align-items:center;justify-content:center;font-size:calc(16px*var(--nav-scale));}
   header.top{display:contents;}
-  header.top h1{font-size:14.5px;margin:0;font-weight:700;color:var(--sidebar-text-active);line-height:1.3;
+  header.top h1{font-size:calc(14px*var(--nav-scale));margin:0;font-weight:700;color:var(--sidebar-text-active);line-height:1.3;
     white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
   header.top .sub{font-size:11px;color:var(--sidebar-text);margin-top:2px;display:none;}
-  nav.tabs{display:flex;flex-direction:column;gap:2px;flex:1;min-height:0;overflow-y:auto;background:transparent;padding:2px 0;
+  nav.tabs{display:flex;flex-direction:column;gap:calc(2px*var(--nav-scale));flex:1;min-height:0;overflow-y:auto;background:transparent;padding:2px 0;
     scrollbar-width:none;}
   nav.tabs::-webkit-scrollbar{display:none;}
   nav.tabs button{flex:0 0 auto;display:flex;align-items:center;gap:10px;text-align:left;background:transparent;
-    border:none;color:var(--sidebar-text);padding:9px 10px;font-size:13.5px;font-family:inherit;cursor:pointer;
+    border:none;color:var(--sidebar-text);padding:calc(8px*var(--nav-scale)) 10px;font-size:calc(13.5px*var(--nav-scale));font-family:inherit;cursor:pointer;
     border-radius:8px;white-space:nowrap;}
-  nav.tabs button .tab-icon{font-size:15px;flex:0 0 18px;text-align:center;opacity:.9;}
+  nav.tabs button .tab-icon{font-size:calc(15px*var(--nav-scale));flex:0 0 18px;text-align:center;opacity:.9;}
   nav.tabs button.active{color:var(--sidebar-text-active);background:var(--sidebar-active-bg);font-weight:600;}
   nav.tabs button:hover:not(.active){background:var(--sidebar-hover-bg);color:var(--sidebar-text-active);}
-  .sidebar-bottom{flex:0 0 auto;display:flex;flex-direction:column;gap:4px;padding-top:8px;margin-top:6px;
+  .sidebar-bottom{flex:0 0 auto;display:flex;flex-direction:column;gap:2px;padding-top:calc(7px*var(--nav-scale));margin-top:calc(5px*var(--nav-scale));
     border-top:1px solid var(--sidebar-line);}
   .sidebar-bottom .settings-btn{flex:0 0 auto;display:flex;align-items:center;gap:10px;text-align:left;background:transparent;
-    border:none;color:var(--sidebar-text);padding:9px 10px;font-size:13.5px;font-family:inherit;cursor:pointer;
+    border:none;color:var(--sidebar-text);padding:calc(8px*var(--nav-scale)) 10px;font-size:calc(13.5px*var(--nav-scale));font-family:inherit;cursor:pointer;
     border-radius:8px;white-space:nowrap;width:100%;}
-  .sidebar-bottom .settings-btn .tab-icon{font-size:15px;flex:0 0 18px;text-align:center;opacity:.9;}
+  .sidebar-bottom .settings-btn .tab-icon{font-size:calc(15px*var(--nav-scale));flex:0 0 18px;text-align:center;opacity:.9;}
   .sidebar-bottom .settings-btn.active{color:var(--sidebar-text-active);background:var(--sidebar-active-bg);font-weight:600;}
   .sidebar-bottom .settings-btn:hover:not(.active){background:var(--sidebar-hover-bg);color:var(--sidebar-text-active);}
   .main-wrap{flex:1;min-width:0;}
@@ -188,7 +193,7 @@
   .profile-avatar{width:30px;height:30px;flex:0 0 30px;border-radius:50%;background:var(--indigo);color:#fff;
     display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;}
   .logout-btn{width:100%;background:transparent;border:1px solid var(--sidebar-line);color:var(--sidebar-text);
-    padding:8px 10px;border-radius:7px;font-size:12.5px;cursor:pointer;font-family:inherit;font-weight:600;transition:background .12s,color .12s;}
+    padding:calc(8px*var(--nav-scale)) 10px;border-radius:7px;font-size:calc(12.5px*var(--nav-scale));cursor:pointer;font-family:inherit;font-weight:600;transition:background .12s,color .12s;}
   .logout-btn:hover{background:var(--sidebar-hover-bg);color:var(--sidebar-text-active);}
   @media (max-width:860px){
     .app{flex-direction:column;}
@@ -585,6 +590,7 @@ function editPaymentModal({title, partyLabel, entry}){
       close({date, party, amount, account, note});
     };
     document.addEventListener('keydown', onKey);
+    enableEnterNav(root.querySelector('.modal-box'), '#epm_save');
     root.querySelector('#epm_date').focus();
   });
 }
@@ -633,6 +639,7 @@ function editPayoutModal({title, recipientLabel, recipients, entry}){
       close({recipientId, date, amount, account, note, fundingTransferIds: transferId ? [transferId] : []});
     };
     document.addEventListener('keydown', onKey);
+    enableEnterNav(root.querySelector('.modal-box'), '#epo_save');
     root.querySelector('#epo_recipient').focus();
   });
 }
@@ -691,6 +698,7 @@ function completeAdvanceModal({advance}){
       close({item, qty, unit, rate});
     };
     document.addEventListener('keydown', onKey);
+    enableEnterNav(root.querySelector('.modal-box'), '#cam_save');
     itemInput.focus();
   });
 }
@@ -733,6 +741,7 @@ function editChequeModal(cheque){
       close({direction, date, party, bank, amount, dueDate, account});
     };
     document.addEventListener('keydown', onKey);
+    enableEnterNav(root.querySelector('.modal-box'), '#ecm_save');
     root.querySelector('#ecm_party').focus();
   });
 }
@@ -971,6 +980,7 @@ function renderClientPicker(){
       await loadState();
     }catch(e){ main.querySelector('#cp_err').textContent = e.message; }
   };
+  enableEnterNav(main, '#cp_go');
 }
 function renderCreateAdmin(){
   const main = document.getElementById('main');
@@ -1101,8 +1111,24 @@ function enableEnterNav(container, addBtnSelector){
         else if(addBtnSelector){ const b = container.querySelector(addBtnSelector); if(b) b.click(); }
       }
     });
-    // re-arm "first Enter opens the list" for next time focus returns here
-    if(el.tagName==='SELECT') el.addEventListener('blur', ()=>{ delete el.dataset.enterOpened; });
+    if(el.tagName==='SELECT'){
+      // re-arm "first Enter opens the list" for next time focus returns here
+      el.addEventListener('blur', ()=>{ delete el.dataset.enterOpened; });
+      // while a native <select>'s own OS-drawn dropdown is open, the browser
+      // doesn't reliably deliver the Enter keypress that closes it back to
+      // our keydown listener above — so picking a value (via arrows+Enter,
+      // or a mouse click) only ever surfaces as a 'change' event. Advance
+      // on that instead of waiting for a second Enter that may never arrive
+      // — this is exactly what made Enter look "dead" after choosing from
+      // a dropdown's list.
+      el.addEventListener('change', ()=>{
+        delete el.dataset.enterOpened;
+        let nextIdx = idx+1;
+        while(fields[nextIdx] && (fields[nextIdx].disabled || fields[nextIdx].offsetParent===null)) nextIdx++;
+        const next = fields[nextIdx];
+        if(next){ next.focus(); if(next.select) next.select(); }
+      });
+    }
   });
 }
 // text input with a keyboard-navigable suggestion list (variety names etc.)
@@ -1241,7 +1267,10 @@ function accountBalance(accId){
   state.purchases.forEach(p=>{
     if(p.staged) return;
     if(p.type==='cash' && (p.account||'cash')===accId) bal -= Number(p.total);
-    else if(p.type==='credit' && p.paid && (p.account||'cash')===accId) bal -= Number(p.total);
+    // paidAmount is what actually left this account when marked paid — may
+    // be less than total if part was already settled by a Return, a
+    // completed Purchase Advance, or a Supplier Payment before that.
+    else if(p.type==='credit' && p.paid && (p.account||'cash')===accId) bal -= Number(p.paidAmount!=null ? p.paidAmount : p.total);
   });
   state.supplierPayments.forEach(p=>{ if(!p.staged && (p.account||'cash')===accId) bal -= Number(p.amount); });
   // a purchase advance is real money handed to the supplier the moment
@@ -1279,7 +1308,7 @@ function accountLedgerRows(accId){
   state.purchases.forEach(p=>{
     if(p.staged) return;
     if(p.type==='cash' && (p.account||'cash')===accId) rows.push({date:p.date, kind:'Purchase (Cash)', desc:p.supplier+' — '+p.item, amount:-Number(p.total)});
-    else if(p.type==='credit' && p.paid && (p.account||'cash')===accId) rows.push({date:p.date, kind:'Purchase (Paid)', desc:p.supplier+' — '+p.item, amount:-Number(p.total)});
+    else if(p.type==='credit' && p.paid && (p.account||'cash')===accId) rows.push({date:p.date, kind:'Purchase (Paid)', desc:p.supplier+' — '+p.item, amount:-Number(p.paidAmount!=null ? p.paidAmount : p.total)});
   });
   state.supplierPayments.forEach(p=>{ if(!p.staged && (p.account||'cash')===accId) rows.push({date:p.date, kind:'Payment to Supplier', desc:p.supplier+(p.note?' — '+p.note:''), amount:-Number(p.amount)}); });
   state.purchaseAdvances.forEach(a=>{ if((a.account||'cash')===accId) rows.push({date:a.date, kind:'Supplier Advance', desc:a.supplier+(a.note?' — '+a.note:''), amount:-Number(a.amount)}); });
@@ -2713,12 +2742,45 @@ function updateHeader(){
   }
 }
 
+// Keeps every sidebar tab visible without ever needing to scroll the nav
+// list, no matter how many buttons it ends up holding (today's set, or any
+// added later). nav.tabs is the flexible middle section between the fixed
+// brand header and the fixed Settings/Logout footer — if its content
+// doesn't fit the space flex gave it, that's exactly what forces the
+// internal scrollbar the sidebar used to need. --nav-scale (see :root)
+// drives every sidebar size via calc() in the stylesheet, so binary-
+// searching it down just enough removes that overflow. Never shrinks
+// below 0.72 — comfortably readable — so an unreasonable number of tabs
+// scrolls (as it always safely could) rather than becoming unreadable.
+function fitSidebarNav(){
+  const navTabs = document.getElementById('tabs');
+  if(!navTabs) return;
+  const root = document.documentElement;
+  const MIN_SCALE = 0.72, MAX_SCALE = 1;
+  function fitsAt(scale){
+    root.style.setProperty('--nav-scale', scale);
+    return navTabs.scrollHeight <= navTabs.clientHeight + 1;
+  }
+  if(fitsAt(MAX_SCALE)) return; // comfortable default already fits — done
+  let lo = MIN_SCALE, hi = MAX_SCALE, best = MIN_SCALE;
+  for(let i=0;i<8;i++){
+    const mid = (lo+hi)/2;
+    if(fitsAt(mid)){ best = mid; lo = mid; } else { hi = mid; }
+  }
+  root.style.setProperty('--nav-scale', best);
+}
+let fitSidebarNavResizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(fitSidebarNavResizeTimer);
+  fitSidebarNavResizeTimer = setTimeout(fitSidebarNav, 120);
+});
 let lastRenderedTab = null; // tracks tab CHANGES specifically, so scroll only resets when you actually navigate — not on every re-render triggered by a form edit, save, etc. within the same tab
 function render(){
   if(!loaded || !session) return;
   applyTheme();
   renderTabs();
   updateHeader();
+  fitSidebarNav();
   const main = document.getElementById('main');
   main.innerHTML = '';
   const fn = { profile:renderProfile, dashboard:renderDashboard, master:renderMaster, sales:renderSales, purchases:renderPurchases,
@@ -3354,6 +3416,7 @@ function renderSales(main){
     srSaleSel.addEventListener('change', updateSrHint);
     srSettlementSel.addEventListener('change', updateSrHint);
     updateSrHint();
+    enableEnterNav(srSaleSel.closest('section'), '#sr_add');
     main.querySelector('#sr_add').onclick = guardDoubleSubmit('sr_add', async ()=>{
       const saleId = srSaleSel.value;
       const date = main.querySelector('#sr_date').value;
@@ -3770,9 +3833,19 @@ function renderPurchases(main){
             <tr>
               <td>${fmtDate(p.date)}</td><td>${p.supplier}</td><td>${p.item}</td><td>${fmtQty(p.qty)} ${p.unit||'kg'}</td><td>${fmtQty(p.rate)}</td><td>Rs ${fmt(p.total)}</td>
               <td>${p.staged ? '<span class="pill role" title="Entered during Historical Data Entry Mode — permanently excluded from Stock/Cash/Bank/Profit, counts only toward the Supplier Ledger">Historical</span>' : (p.type==='cash' ? '<span class="pill cash">Cash</span>' : (creditPurchaseStatus(p)==='clear'?'<span class="pill ok">Paid</span>':creditPurchaseStatus(p)==='partial'?'<span class="pill partial">Partially Paid</span>':'<span class="pill credit">Payable</span>'))}</td>
-              ${ro?'':`<td class="row-actions">${(!p.staged && p.type==='credit' && creditPurchaseStatus(p)!=='clear') ? `<select class="acc-select" data-paccfor="${p.id}">${accountOptionsHtmlNoLocker('cash')}</select> <button class="btn danger" data-ppaid="${p.id}">Mark Paid</button>` : ''}
+              ${ro?'':(()=>{
+                // "Mark Paid" now only ever draws the OUTSTANDING remainder
+                // from the chosen account — never the full original total —
+                // so it stays safe to use even when a Purchase Advance,
+                // Return, or Supplier Payment already settled part of it
+                // (the server enforces the same outstanding-only amount).
+                const outstanding = creditPurchaseOutstanding(p);
+                const showMarkPaid = !p.staged && p.type==='credit' && creditPurchaseStatus(p)!=='clear';
+                const partiallySettled = showMarkPaid && Math.abs(outstanding - Number(p.total)) >= 0.01;
+                return `<td class="row-actions">${showMarkPaid ? `<select class="acc-select" data-paccfor="${p.id}">${accountOptionsHtmlNoLocker('cash')}</select> <button class="btn danger" data-ppaid="${p.id}">${partiallySettled ? `Pay Remaining (Rs ${fmtPlain(outstanding)})` : 'Mark Paid'}</button>` : ''}
                 <button class="btn danger" data-pedit="${p.id}">Edit</button>
-                <button class="btn danger" data-pdelete="${p.id}">Delete</button></td>`}
+                <button class="btn danger" data-pdelete="${p.id}">Delete</button></td>`;
+              })()}
             </tr>`).join('') || `<tr><td colspan="8" class="empty">No purchases entered yet</td></tr>`}
         </tbody>
       </table>
@@ -3925,8 +3998,8 @@ function renderPurchases(main){
       const sel = main.querySelector(`[data-paccfor="${b.dataset.ppaid}"]`);
       const account = sel ? sel.value : 'cash';
       const purchase = state.purchases.find(p=>p.id===b.dataset.ppaid);
-      const total = purchase ? Number(purchase.total) : 0;
-      const ok = await ensureFundsAvailable({ date: todayStr(), account, total, getAvailable: accountBalance });
+      const outstanding = purchase ? creditPurchaseOutstanding(purchase) : 0;
+      const ok = await ensureFundsAvailable({ date: todayStr(), account, total: outstanding, getAvailable: accountBalance });
       if(!ok) return;
       try { await api('POST', '/api/purchases/'+b.dataset.ppaid+'/mark-paid', {account}); await refreshState(); showToast('Marked as paid'); }
       catch(e){ await showAlert(e.message); }
@@ -3974,6 +4047,7 @@ function renderPurchases(main){
     );
     paAccount.addEventListener('change', updatePaFunding);
     main.querySelector('#pa_amount').addEventListener('input', updatePaFunding);
+    enableEnterNav(paAccount.closest('section'), '#pa_add');
     main.querySelector('#pa_add').onclick = guardDoubleSubmit('pa_add', async ()=>{
       const date = main.querySelector('#pa_date').value, supplier = main.querySelector('#pa_supplier').value.trim(),
         amount = Number(main.querySelector('#pa_amount').value), account = paAccount.value,
@@ -4037,6 +4111,7 @@ function renderPurchases(main){
     prPurchaseSel.addEventListener('change', updatePrHint);
     prSettlementSel.addEventListener('change', updatePrHint);
     updatePrHint();
+    enableEnterNav(prPurchaseSel.closest('section'), '#pr_add');
     main.querySelector('#pr_add').onclick = guardDoubleSubmit('pr_add', async ()=>{
       const purchaseId = prPurchaseSel.value;
       const date = main.querySelector('#pr_date').value;
@@ -5131,6 +5206,7 @@ function renderExpenses(main){
     }
     miModeSel.onchange = syncMiMode;
     syncMiMode();
+    enableEnterNav(miSupplierInput.closest('section'), '#mi_add');
     main.querySelector('#mi_add').onclick = guardDoubleSubmit('mi_add', async ()=>{
       const date = main.querySelector('#mi_date').value, desc = main.querySelector('#mi_desc').value.trim(),
         amount = Number(main.querySelector('#mi_amount').value), mode = miModeSel.value,
@@ -5922,6 +5998,7 @@ function renderSettings(main){
           }
         }
       };
+      enableEnterNav(main.querySelector('#bs_enabled').closest('section'), '#bs_save');
       main.querySelector('#bs_save').onclick = async()=>{
         try{
           const freq = main.querySelector('#bs_freq').value;
