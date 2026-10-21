@@ -276,7 +276,8 @@ let editingBankId = null;
 let editingPartyId = null;
 let editingSupplierId = null;
 let editingStockId = null;
-let masterTab = 'material'; // 'material' | 'supplier' | 'buyer'
+let masterTab = 'material'; // 'material' | 'supplier' | 'buyer' | 'history'
+let historyPartyFilter = '__all__';
 let financeTab = 'cheque'; // 'cheque' | 'payment' | 'transfer' — sub-tabs of the Financial Entry tab
 let editingExpenseId = null;
 let auditFrom = '';
@@ -3138,12 +3139,93 @@ function wireBuyerSection(main){
   });
   enableEnterNav(main.querySelector('#by_name').closest('section'), '#by_add');
 }
+// Read-only report: last 10 sales (or, filtered to one party, every sale made
+// to them) with each row's own cost basis and profit % — cost/profit come
+// straight off the sale record (same batch-level figures totalProfitAllSales()
+// uses), never recomputed here, so this can never drift from Reports/Dashboard.
+function saleHistorySectionHtml(){
+  const allSales = state.sales.filter(s=>!s.staged);
+  const partyNames = Array.from(new Set(allSales.map(s=>s.party))).sort((a,b)=>a.localeCompare(b));
+  const filterVal = historyPartyFilter;
+  const filtered = filterVal==='__all__' ? allSales : allSales.filter(s=>s.party===filterVal);
+  const sorted = filtered.slice().sort((a,b)=> new Date(b.date) - new Date(a.date));
+  const rows = filterVal==='__all__' ? sorted.slice(0,10) : sorted;
+  const saleCost = s => Number(s.total) - Number(s.profit||0);
+  const profitPctRaw = s => Number(s.total)>0 ? (Number(s.profit||0)/Number(s.total)*100) : 0;
+  // Credit tied up for 90 days ties up the capital for 3 months, 45 days for
+  // 1.5 months, etc. — so the profit % earned over that whole period is spread
+  // across however many months it actually took, not shown as a flat one-off
+  // number. A cash sale has no such holding period (payment is immediate), so
+  // its profit % is shown as-is rather than divided by a near-zero duration.
+  const monthsForSale = s => {
+    if(s.type!=='credit') return null;
+    if(s.creditDays) return Number(s.creditDays)/30;
+    if(s.date && s.dueDate){
+      const days = Math.round((new Date(s.dueDate) - new Date(s.date))/86400000);
+      if(days>0) return days/30;
+    }
+    return null;
+  };
+  const profitPctMonthly = s => {
+    const months = monthsForSale(s);
+    const raw = profitPctRaw(s);
+    return (months && months>0) ? raw/months : raw;
+  };
+  const summary = filterVal==='__all__' ? '' : (()=>{
+    const totalSale = rows.reduce((a,s)=>a+Number(s.total),0);
+    const totalCost = rows.reduce((a,s)=>a+saleCost(s),0);
+    const totalProfit = rows.reduce((a,s)=>a+Number(s.profit||0),0);
+    const weightedMonthly = rows.reduce((a,s)=>a+profitPctMonthly(s)*Number(s.total),0);
+    const avgMonthlyPct = totalSale>0 ? (weightedMonthly/totalSale) : 0;
+    return `<div class="cards" style="margin-bottom:14px;">
+      <div class="card"><div class="label">Total Sale Value</div><div class="value-row"><div class="value">Rs ${fmt(totalSale)}</div></div></div>
+      <div class="card"><div class="label">Total Cost</div><div class="value-row"><div class="value">Rs ${fmt(totalCost)}</div></div></div>
+      <div class="card"><div class="label">Total Profit</div><div class="value-row"><div class="value">Rs ${fmt(totalProfit)}</div></div></div>
+      <div class="card"><div class="label">Avg. Profit %/Month</div><div class="value-row"><div class="value">${avgMonthlyPct.toFixed(1)}%</div></div></div>
+    </div>`;
+  })();
+  return `
+    <section class="block">
+      <h2>Purchase/Sale — Sales Rate &amp; Profit History</h2>
+      <div class="form-grid" style="margin-bottom:10px;">
+        <div><label>Party</label><select id="hist_party">
+          <option value="__all__" ${filterVal==='__all__'?'selected':''}>All Parties — Last 10 Entries</option>
+          ${partyNames.map(p=>`<option value="${escapeHtml(p)}" ${filterVal===p?'selected':''}>${escapeHtml(p)}</option>`).join('')}
+        </select></div>
+      </div>
+      ${summary}
+      <div style="overflow-x:auto;">
+      <table>
+        <thead><tr><th>Date</th>${filterVal==='__all__'?'<th>Party</th>':''}<th>Item</th><th>Qty</th><th>Cost/Unit</th><th>Total Cost</th><th>Sale Rate</th><th>Sale Value</th><th>Profit (Rs)</th><th>Profit %/Month</th></tr></thead>
+        <tbody>
+          ${rows.map(s=>{ const months = monthsForSale(s); const cost = saleCost(s); const costPerUnit = Number(s.qty)>0 ? cost/Number(s.qty) : 0; return `<tr>
+            <td>${fmtDate(s.date)}</td>
+            ${filterVal==='__all__'?`<td>${escapeHtml(s.party)}</td>`:''}
+            <td>${escapeHtml(s.item)}</td>
+            <td>${fmtQtyPlain(s.qty)} ${escapeHtml(s.unit)}</td>
+            <td>Rs ${fmtQtyPlain(costPerUnit)}</td>
+            <td>Rs ${fmtQtyPlain(cost)}</td>
+            <td>Rs ${fmtQtyPlain(s.rate)}</td>
+            <td>Rs ${fmtQtyPlain(s.total)}</td>
+            <td>Rs ${fmtQtyPlain(s.profit||0)}</td>
+            <td>${profitPctMonthly(s).toFixed(1)}%${months?` <span style="opacity:.6;font-size:11px;">(${months.toFixed(1)} mo)</span>`:(s.type==='credit'?' <span style="opacity:.6;font-size:11px;">(no credit days set)</span>':' <span style="opacity:.6;font-size:11px;">(cash)</span>')}</td>
+          </tr>`; }).join('') || `<tr><td colspan="${filterVal==='__all__'?10:9}" class="empty">No sales found</td></tr>`}
+        </tbody>
+      </table>
+      </div>
+      <div class="settings-note" style="margin-top:10px;">Profit %/Month = (Profit ÷ Sale Value × 100) ÷ months the sale's credit was outstanding (Credit Days ÷ 30 — e.g. 90 days = 3 months, 45 days = 1.5 months), using each sale's actual cost basis (the purchase batch it was sold from). Cash sales have no credit period, so their profit % is shown as-is. Historical (staged) sales are excluded, same as elsewhere in Reports. "All Parties" shows only the most recent 10 entries; pick a specific party to see every sale made to them, along with their total cost and total profit.</div>
+    </section>`;
+}
+function wireSaleHistorySection(main){
+  main.querySelector('#hist_party').onchange = (e)=>{ historyPartyFilter = e.target.value; render(); };
+}
 function renderMaster(main){
   const ro = !canEditActiveClient();
   const MASTER_TABS = [
     {id:'material', label:'Material'},
     {id:'supplier', label:'Supplier'},
-    {id:'buyer', label:'Buyer'}
+    {id:'buyer', label:'Buyer'},
+    {id:'history', label:'Purchase/Sale'}
   ];
   const tab = MASTER_TABS.find(t=>t.id===masterTab) ? masterTab : 'material';
   main.innerHTML = `
@@ -3151,10 +3233,12 @@ function renderMaster(main){
     ${tab==='material' ? materialSectionHtml(ro) : ''}
     ${tab==='supplier' ? supplierSectionHtml(ro) : ''}
     ${tab==='buyer' ? buyerSectionHtml(ro) : ''}
+    ${tab==='history' ? saleHistorySectionHtml() : ''}
   `;
   main.querySelectorAll('[data-mtab]').forEach(b=>{
     b.onclick = ()=>{ masterTab = b.dataset.mtab; render(); };
   });
+  if(tab==='history') wireSaleHistorySection(main);
   if(ro) return;
   if(tab==='material') wireMaterialSection(main);
   if(tab==='supplier') wireSupplierSection(main);
@@ -3177,6 +3261,7 @@ function renderSales(main){
         <div><label>Quantity</label><input type="number" id="s_qty" value="${editing?editing.qty:''}"></div>
         <div><label>Unit</label><select id="s_unit"><option value="bags" ${(!editing||editing.unit==='bags')?'selected':''}>Bags</option><option value="kg" ${editing&&editing.unit==='kg'?'selected':''}>KG</option></select></div>
         <div id="s_batch_wrap" style="display:none;"><label>Purchase Batch (this sale's cost)</label><select id="s_batch" class="select-required"></select></div>
+        <div id="s_profit_pct_wrap" style="display:${(!editing && !state.settings.setupMode) ? 'block' : 'none'};"><label>Profit % (optional — suggests a Rate)</label><input type="number" id="s_profit_pct" placeholder="e.g. 2.5"></div>
         <div><label>Rate per Unit</label><input type="number" id="s_rate" value="${editing?editing.rate:''}"></div>
         <div><label>Bill / Total Amount</label><input id="s_total_display" value="${editing?fmtQtyPlain(Number(editing.qty)*Number(editing.rate)):''}" disabled></div>
         <div><label>Payment Type</label>
@@ -3324,6 +3409,35 @@ function renderSales(main){
   }
   s_qty.addEventListener('input', updateSaleTotalDisplay);
   s_rate.addEventListener('input', updateSaleTotalDisplay);
+  // Profit % box: a one-time price SUGGESTION, never persisted and never
+  // sent to the server — it only ever writes a number into Rate, which the
+  // user is always free to then edit by hand (the final bill is never locked
+  // to this %). It only exists on a fresh New Sale Entry — once a sale is
+  // saved, Edit Sale Entry never shows it again (see its display:none above).
+  const s_profit_pct = main.querySelector('#s_profit_pct');
+  if(s_profit_pct){
+    function batchCostRate(){
+      if(!usesBatches || s_batch_wrap.style.display==='none' || !s_batch.value) return null;
+      const name = main.querySelector('#s_item').value.trim();
+      const unit = s_unit.value;
+      const batches = saleBatchesForItem(name, unit, editing?editing.id:null);
+      const chosen = batches.find(b=>b.id===s_batch.value);
+      return chosen ? Number(chosen.rate) : null;
+    }
+    function applyProfitPct(){
+      const pct = Number(s_profit_pct.value);
+      const cost = batchCostRate();
+      if(cost==null || !s_profit_pct.value || !isFinite(pct)) return;
+      // round to 2dp FIRST — cost*(1+pct/100) is routinely something like
+      // 30749.999999999996 in raw floating point, which would otherwise fail
+      // Number.isInteger and show "30750.00" instead of a clean "30750".
+      const suggested = Math.round(cost * (1 + pct/100) * 100) / 100;
+      s_rate.value = Number.isInteger(suggested) ? String(suggested) : suggested.toFixed(2);
+      updateSaleTotalDisplay();
+    }
+    s_profit_pct.addEventListener('input', applyProfitPct);
+    s_batch.addEventListener('change', applyProfitPct);
+  }
   main.querySelector('#s_type').onchange = (e)=>{
     const isCredit = e.target.value==='credit';
     main.querySelector('#s_due_wrap').style.display = isCredit ? 'block':'none';
