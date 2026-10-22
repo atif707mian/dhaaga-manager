@@ -863,7 +863,7 @@ async function resolveSaleBatch(db, clientId, item, unit, sourcePurchaseId, excl
       : 0;
     return { rate: openingRate, remaining: openingQty - soldQty + returnedQty };
   }
-  const purch = await db.query('SELECT qty, rate, item, unit FROM purchases WHERE id=$1 AND client_id=$2', [sourcePurchaseId, clientId]);
+  const purch = await db.query('SELECT qty, rate, item, unit, date FROM purchases WHERE id=$1 AND client_id=$2', [sourcePurchaseId, clientId]);
   if (!purch.rows[0]) return { notFound: true };
   if (purch.rows[0].item !== item || purch.rows[0].unit !== unit) return { mismatch: true };
   const params2 = [clientId, sourcePurchaseId];
@@ -878,7 +878,37 @@ async function resolveSaleBatch(db, clientId, item, unit, sourcePurchaseId, excl
   // a purchase return draws down this same batch exactly like a sale would
   // (the goods leave stock, just back to the supplier instead of a buyer).
   const purchaseReturnedQty = Number((await db.query('SELECT COALESCE(SUM(qty),0) AS s FROM purchase_returns WHERE purchase_id=$1', [sourcePurchaseId])).rows[0].s);
-  return { rate: Number(purch.rows[0].rate), remaining: Number(purch.rows[0].qty) - soldQty2 + salesReturnedQty - purchaseReturnedQty };
+  const unlinkedWindowQty = await unlinkedSalesInBatchWindowDb(db, clientId, item, unit, sourcePurchaseId, purch.rows[0].date, excludeSaleId);
+  return { rate: Number(purch.rows[0].rate), remaining: Number(purch.rows[0].qty) - soldQty2 + salesReturnedQty - purchaseReturnedQty - unlinkedWindowQty };
+}
+// A sale created before the exact-batch costing requirement existed (or
+// otherwise saved with no source_purchase_id) is invisible to the FK-based
+// subtraction above — a real incident (MA Traders, 2026-10-22) had one such
+// sale fully consume a batch, and because nothing subtracted it, that same
+// batch still looked fully available six weeks later and a NEW sale got
+// wrongly linked to it at its old (lower) cost, overstating that sale's
+// profit. This closes the gap defensively for any OTHER already-existing
+// unlinked row: an unlinked, non-staged sale of the same item/unit counts
+// against whichever batch was the active (oldest not-yet-superseded) one on
+// its own date — i.e. any batch whose date it falls on-or-after, up to (but
+// excluding) the next later batch of the same item/unit. Ties between two
+// batches dated the same day are broken by id so a given unlinked sale is
+// never attributed to more than one batch at once.
+async function unlinkedSalesInBatchWindowDb(db, clientId, item, unit, batchId, batchDate, excludeSaleId) {
+  const nextRes = await db.query(
+    `SELECT MIN(date) AS next_date FROM purchases
+     WHERE client_id=$1 AND item=$2 AND unit=$3 AND NOT staged AND id<>$4
+       AND (date > $5 OR (date = $5 AND id > $4))`,
+    [clientId, item, unit, batchId, batchDate]
+  );
+  const nextDate = nextRes.rows[0] ? nextRes.rows[0].next_date : null;
+  const params = [clientId, item, unit, batchDate];
+  let sql = `SELECT COALESCE(SUM(qty),0) AS s FROM sales
+     WHERE client_id=$1 AND item=$2 AND unit=$3 AND NOT staged AND source_purchase_id IS NULL AND date >= $4`;
+  if (nextDate) { sql += ' AND date < $5'; params.push(nextDate); }
+  if (excludeSaleId) { sql += ` AND id != $${params.length + 1}`; params.push(excludeSaleId); }
+  const r = await db.query(sql, params);
+  return Number(r.rows[0].s) || 0;
 }
 // A purchase being edited (qty reduced) or deleted (newQty=0) can't leave
 // less in that batch than what sales/returns already named it for — the
@@ -1024,10 +1054,16 @@ async function computeAccountBalanceDb(db, clientId, accId) {
 
   return bal;
 }
+// Round 19 Bug 7: this message is shared by every "money leaving an
+// account" check in the app, and showed raw figures ("Rs 1200.00") instead
+// of the comma-grouped, whole-rupee format every other amount on screen
+// uses ("Rs 1,200") — fixed once, here, so it's consistent everywhere this
+// is thrown from, not just the one Sales Return repro it was first seen on.
+function fmtMoneyServer(n) { return Math.round(Number(n) || 0).toLocaleString('en-US'); }
 async function assertFundsAvailable(db, clientId, accId, amount) {
   const balance = await computeAccountBalanceDb(db, clientId, accId);
   if (Number(amount) > balance + 0.009) {
-    const e = new Error(`Insufficient funds: this account only has Rs ${balance.toFixed(2)} available, but Rs ${Number(amount).toFixed(2)} is needed.`);
+    const e = new Error(`Insufficient funds: this account only has Rs ${fmtMoneyServer(balance)} available, but Rs ${fmtMoneyServer(amount)} is needed.`);
     e.code = 'INSUFFICIENT_FUNDS';
     throw e;
   }
@@ -1081,7 +1117,6 @@ async function supplierPurchaseFifoAppliedDb(db, clientId, supplier, purchaseId)
     "SELECT COALESCE(SUM(amount),0) s FROM misc_income WHERE client_id=$1 AND mode='supplier' AND supplier=$2",
     [clientId, supplier]
   );
-  const paymentsPool = Number(paymentsRes.rows[0].s) + Number(miscIncomeRes.rows[0].s);
   // same principle as the sales side above: a return always shrinks THIS
   // purchase's own effective total first, rather than joining the pool.
   const returnsRes = await db.query(
@@ -1099,6 +1134,20 @@ async function supplierPurchaseFifoAppliedDb(db, clientId, supplier, purchaseId)
     [clientId, supplier]
   );
   const advancesByPurchase = new Map(advancesRes.rows.map((r) => [r.purchase_id, Number(r.s)]));
+  // If an advance was BIGGER than the purchase it ended up funding, the
+  // extra previously just vanished — the bank was debited for the full
+  // advance, but nothing ever reflected the leftover (Round 19 Bug 1).
+  // Mirrors supplierAdvanceExcessTotal() on the frontend exactly: fold it
+  // into the same pool paymentsPool already uses, so it applies automatically
+  // to this supplier's next purchase instead of silently disappearing.
+  let advanceExcessTotal = 0;
+  const purchasesById = new Map(purchasesRes.rows.map((p) => [p.id, p]));
+  for (const [pid, amt] of advancesByPurchase) {
+    const purch = purchasesById.get(pid);
+    const purchaseNet = Math.max(0, Number(purch ? purch.total : 0) - (returnsByPurchase.get(pid) || 0));
+    advanceExcessTotal += Math.max(0, amt - purchaseNet);
+  }
+  const paymentsPool = Number(paymentsRes.rows[0].s) + Number(miscIncomeRes.rows[0].s) + advanceExcessTotal;
   let pool = paymentsPool;
   for (const p of purchasesRes.rows) {
     if (p.type === 'cash' || p.paid) continue;
@@ -2064,7 +2113,20 @@ app.delete('/api/purchases/:id', ...editorAccess, async (req, res) => {
       if (old.type === 'credit' && !old.paid) {
         const applied = await supplierPurchaseFifoAppliedDb(db, req.clientId, old.supplier, old.id);
         if (applied > 0.009) {
-          const e = new Error(`Rs ${applied.toFixed(2)} has already been paid against this purchase (FIFO-applied from ${old.supplier}'s payments) — delete or edit that payment from the Ledger first, then this purchase.`);
+          // Round 19 Bug 3: a purchase created via Complete Purchase on a
+          // Supplier Advance can still get blocked here — not because of the
+          // advance itself (that part always correctly reopens below), but
+          // because this purchase's remaining balance (after the advance)
+          // drew on a SEPARATE, pooled supplier payment. That was confusing
+          // with the generic message alone ("there is no such payment"),
+          // since the advance is the only thing visibly tied to this
+          // purchase — say so explicitly and point at where the real
+          // blocker actually lives.
+          const linkedAdvance = await db.query("SELECT amount FROM purchase_advances WHERE purchase_id=$1 AND client_id=$2 AND status='completed'", [req.params.id, req.clientId]);
+          const advanceNote = linkedAdvance.rows[0]
+            ? ` This purchase was completed from a Supplier Advance of Rs ${Number(linkedAdvance.rows[0].amount).toFixed(2)} — that part is fine and will return to "Pending" automatically once this delete goes through. The Rs ${applied.toFixed(2)} blocking it is a SEPARATE supplier payment pooled across ${old.supplier}'s other purchases, not the advance — check ${old.supplier}'s Supplier Ledger → Payments History to find and edit/delete that payment first.`
+            : '';
+          const e = new Error(`Rs ${applied.toFixed(2)} has already been paid against this purchase (FIFO-applied from ${old.supplier}'s payments) — delete or edit that payment from the Ledger first, then this purchase.${advanceNote}`);
           e.code = 'HAS_PAYMENTS';
           throw e;
         }
@@ -3184,6 +3246,23 @@ app.delete('/api/transfers/:id', ...editorAccess, async (req, res) => {
       const r = await db.query('SELECT * FROM transfers WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       if (!r.rows[0]) return false;
       const old = r.rows[0];
+      // Round 19 Bug 5: deleting a transfer un-does both legs — the FROM
+      // account's deduction is reversed (its balance only ever goes UP, so
+      // that side can never go negative) but the TO account loses the credit
+      // it received, which CAN go negative if that money has already been
+      // spent elsewhere. This had no check at all — deleting the real
+      // "Auto-transfer to cover a shortfall" behind a cash purchase left
+      // Cash at Rs -125,400 with no warning (the 2026-10-22 incident).
+      const toBalance = await computeAccountBalanceDb(db, req.clientId, old.to_account);
+      if (Number(old.amount) > toBalance + 0.009) {
+        const shortBy = (Number(old.amount) - toBalance).toFixed(2);
+        const resultingBalance = (toBalance - Number(old.amount)).toFixed(2);
+        const toName = old.to_account === 'cash' ? 'Cash'
+          : (await db.query('SELECT name FROM bank_accounts WHERE id=$1 AND client_id=$2', [old.to_account, req.clientId])).rows[0]?.name || 'That account';
+        const e = new Error(`Deleting this transfer would take ${toName} to Rs ${resultingBalance} (short by Rs ${shortBy}) — its money has already been spent elsewhere. Delete or edit whatever used it first${old.note === 'Auto-transfer to cover a shortfall' ? ' (likely the purchase or entry this shortfall-cover transfer was created for)' : ''}, then this transfer.`);
+        e.code = 'INSUFFICIENT_FUNDS';
+        throw e;
+      }
       await deleteFundingLinks(db, req.clientId, old.funding_transfer_ids, old.funding_loan_ids);
       await db.query('DELETE FROM transfers WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       await writeAudit(db, req.clientId, 'transfer', 'delete', { entry: { date: old.date, amount: old.amount, fromAccount: old.from_account, toAccount: old.to_account, note: old.note } });
@@ -3193,6 +3272,7 @@ app.delete('/api/transfers/:id', ...editorAccess, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     if (err.code === 'HAS_PAYMENTS') return res.status(400).json({ error: err.message });
+    if (err.code === 'INSUFFICIENT_FUNDS') return res.status(400).json({ error: err.message });
     console.error('DELETE /api/transfers/:id error:', err);
     res.status(500).json({ error: 'Unable to delete transfer' });
   }

@@ -440,10 +440,10 @@ function trendCard(label, latestValue, values, color, isRs){
 }
 function weeklyTrendsHtml(){
   const weeks = lastNWeekBuckets(8);
-  const purchTrend = weeks.map(w=> state.purchases.filter(p=>!p.staged && p.date>=w.start && p.date<=w.end).reduce((a,p)=>a+Number(p.total||0),0));
-  const salesTrend = weeks.map(w=> state.sales.filter(s=>!s.staged && s.date>=w.start && s.date<=w.end).reduce((a,s)=>a+Number(s.total||0),0));
+  const purchTrend = weeks.map(w=> state.purchases.filter(p=>!p.staged && p.date>=w.start && p.date<=w.end).reduce((a,p)=>a+purchaseNetTotal(p),0));
+  const salesTrend = weeks.map(w=> state.sales.filter(s=>!s.staged && s.date>=w.start && s.date<=w.end).reduce((a,s)=>a+saleNetTotal(s),0));
   const commTrend = weeks.map(w=> state.sales.filter(s=>!s.staged && s.date>=w.start && s.date<=w.end && s.partnerId && s.profit!==undefined)
-    .reduce((a,s)=>a+ Math.max(0, Number(s.profit)||0) * ((Number(s.partnerPercent)||0)/100), 0));
+    .reduce((a,s)=>a+saleCommissionAfterReturns(s), 0));
   const topStock = state.stock.slice().sort((a,b)=> (b.qty*b.avgCost) - (a.qty*a.avgCost)).slice(0,8);
   return `
     <section class="block">
@@ -1059,6 +1059,27 @@ function enableEnterNav(container, addBtnSelector){
     // the dropdown, arrows browse every option with its balance, Enter
     // picks one) and only advance once a real value has actually been set.
     if(el.tagName==='SELECT' && el.classList.contains('select-required')){
+      // Relying on the browser's own native Enter-on-a-closed-select behavior
+      // (as this used to) turned out unreliable in practice — on Windows
+      // Chrome it can reopen the same dropdown on every Enter press without
+      // ever registering a choice, so the field looked permanently stuck.
+      // Give it the exact same explicit open-then-advance handling a plain
+      // select gets below, with one difference: a bare Enter with nothing
+      // chosen yet must never advance past a REQUIRED field (e.g. "Cover
+      // Shortfall From") — it only (re)opens the list until a real value is
+      // set, same intent as before, just made to actually work.
+      el.addEventListener('keydown', (e)=>{
+        if(e.key!=='Enter') return;
+        e.preventDefault();
+        if(!el.value){
+          if(typeof el.showPicker==='function'){ try{ el.showPicker(); }catch(err){} }
+          return;
+        }
+        let nextIdx = idx+1;
+        while(fields[nextIdx] && (fields[nextIdx].disabled || fields[nextIdx].offsetParent===null)) nextIdx++;
+        const next = fields[nextIdx];
+        if(next){ next.focus(); if(next.select) next.select(); }
+      });
       el.addEventListener('change', ()=>{
         if(!el.value) return;
         // advance focus to the next field only — NEVER auto-click the
@@ -1208,14 +1229,33 @@ function saleBatchesForItem(name, unit, excludeSaleId){
     const remaining = Number(stockItem.openingQty) - batchSoldQty(matching, excludeSaleId);
     if(remaining>0.001) batches.push({id:'opening', rate:Number(stockItem.openingRate), remaining, label:`Opening Stock — ${fmtQtyPlain(remaining)} ${unit} left @ Rs ${fmtPlain(stockItem.openingRate)}`});
   }
-  state.purchases.filter(p=>!p.staged && p.item===name && p.unit===unit).forEach(p=>{
+  const samePurchases = state.purchases.filter(p=>!p.staged && p.item===name && p.unit===unit);
+  samePurchases.forEach(p=>{
     const matching = state.sales.filter(s=>!s.staged && s.sourcePurchaseId===p.id);
     // a purchase return draws down this same batch exactly like a sale would.
     const purchaseReturned = purchaseReturnsQtyFor(p.id);
-    const remaining = Number(p.qty) - batchSoldQty(matching, excludeSaleId) - purchaseReturned;
+    const unlinkedWindowQty = unlinkedSalesInBatchWindow(name, unit, p, samePurchases, excludeSaleId);
+    const remaining = Number(p.qty) - batchSoldQty(matching, excludeSaleId) - purchaseReturned - unlinkedWindowQty;
     if(remaining>0.001) batches.push({id:p.id, rate:Number(p.rate), remaining, label:`${fmtDate(p.date)} (${p.supplier}) — ${fmtQtyPlain(remaining)} ${unit} left @ Rs ${fmtPlain(p.rate)}`});
   });
   return batches;
+}
+// Mirrors the server's unlinkedSalesInBatchWindowDb() exactly — see its
+// comment for why this exists (a sale saved with no sourcePurchaseId is
+// invisible to the simple per-batch FK subtraction above, which let an
+// already-exhausted batch keep looking "available" for a later sale).
+function unlinkedSalesInBatchWindow(name, unit, p, samePurchases, excludeSaleId){
+  let nextDate = null;
+  samePurchases.forEach(o=>{
+    if(o.id===p.id) return;
+    if(o.date>p.date || (o.date===p.date && o.id>p.id)){
+      if(nextDate===null || o.date<nextDate) nextDate = o.date;
+    }
+  });
+  return state.sales
+    .filter(s=>!s.staged && s.item===name && s.unit===unit && !s.sourcePurchaseId && s.id!==excludeSaleId)
+    .filter(s=> s.date>=p.date && (nextDate===null || s.date<nextDate))
+    .reduce((a,s)=>a+Number(s.qty),0);
 }
 function purchaseReturnsQtyFor(purchaseId){
   return state.purchaseReturns.filter(r=>r.purchaseId===purchaseId).reduce((a,r)=>a+Number(r.qty),0);
@@ -1678,7 +1718,23 @@ function supplierPaymentsTotal(supplier){
   // a payment would, without any money actually moving, so it joins the
   // same pool every payable/pending/advance calculation already uses.
   const credited = state.miscIncome.filter(m=>m.mode==='supplier' && m.supplier===supplier).reduce((a,m)=>a+Number(m.amount),0);
-  return paid + credited;
+  return paid + credited + supplierAdvanceExcessTotal(supplier);
+}
+// A completed Supplier Advance always settles its own linked purchase first
+// (purchaseAdvanceAppliedFor, used by supplierCreditPurchasesTotal below) —
+// but if the advance was BIGGER than that purchase ended up costing, the
+// extra previously just vanished: the bank was still debited for the full
+// advance, yet nothing showed the leftover anywhere (Round 19 Bug 1). Folded
+// into the same pool every payable/pending/advance calculation already uses,
+// exactly like partyAdvanceBalance/an overpayment does — it now shows as a
+// real Advance and applies automatically to this supplier's next purchase.
+function supplierAdvanceExcessTotal(supplier){
+  return state.purchaseAdvances.filter(a=>a.status==='completed' && a.supplier===supplier).reduce((sum,a)=>{
+    const p = state.purchases.find(x=>x.id===a.purchaseId);
+    if(!p) return sum;
+    const purchaseNet = Math.max(0, Number(p.total) - purchaseReturnsTotal(p.id));
+    return sum + Math.max(0, Number(a.amount) - purchaseNet);
+  }, 0);
 }
 function supplierCreditPurchasesTotal(supplier){
   return state.purchases.filter(p=>p.supplier===supplier && p.type==='credit' && !p.paid)
@@ -1980,13 +2036,34 @@ function investorSummaryRowsTotal(rows){
     netOwed: a.netOwed+Number(x.netOwed)
   }), {investment:0, expenseShare:0, netProfit:0, paidOut:0, netOwed:0});
 }
+// Round 19 Bug 4: a Sales Return shrinks what a sale actually earned, but
+// nothing downstream (profit, commission, Trade Summary) ever looked at
+// state.salesReturns at all — a full return left Gross Profit and the
+// agent's commission exactly as if the goods were still sold. These three
+// helpers are the single place that return-adjusts a sale/purchase, reused
+// by every total below so none of them can drift out of sync with each
+// other. Profit is assumed to scale evenly across the batch (same
+// profit-per-unit the sale itself was priced at), matching how profit was
+// computed in the first place (one flat rate - cost per unit).
+function saleProfitAfterReturns(sale){
+  if(sale.profit===undefined || sale.profit===null) return 0;
+  const qty = Number(sale.qty)||0;
+  if(!qty) return Number(sale.profit);
+  return Number(sale.profit) - (Number(sale.profit)/qty) * saleReturnsQtyFor(sale.id);
+}
+function saleCommissionAfterReturns(sale){
+  if(!sale.partnerId || sale.profit===undefined) return 0;
+  // a loss-making (or now-returned-to-a-loss) sale must never create a
+  // negative commission — the agent's cut only ever applies to an actual profit.
+  return Math.max(0, saleProfitAfterReturns(sale)) * ((Number(sale.partnerPercent)||0)/100);
+}
+function saleNetTotal(sale){ return Number(sale.total) - saleReturnsTotal(sale.id); }
+function purchaseNetTotal(purchase){ return Number(purchase.total) - purchaseReturnsTotal(purchase.id); }
 function partnerTotalEarnings(partner){
   let total = Number(partner.openingProfit)||0;
   state.sales.forEach(s=>{
     if(s.staged || s.profit===undefined || s.partnerId!==partner.id) return;
-    // a loss-making sale (negative profit) must never create a negative
-    // commission — the agent's cut only ever applies to an actual profit.
-    total += Math.max(0, s.profit) * ((Number(s.partnerPercent)||0)/100);
+    total += saleCommissionAfterReturns(s);
   });
   return total;
 }
@@ -1999,7 +2076,7 @@ function partnerLedgerRows(partner){
   const rows = [];
   state.sales.forEach(s=>{
     if(s.staged || s.profit===undefined || s.partnerId!==partner.id) return;
-    const commission = Math.max(0, s.profit) * ((Number(s.partnerPercent)||0)/100);
+    const commission = saleCommissionAfterReturns(s);
     rows.push({date:s.date, kind:'commission', party:s.party, item:s.item, sale:s, amount:commission});
   });
   state.payouts.forEach(p=>{
@@ -2021,7 +2098,7 @@ function partnerLedgerRows(partner){
 function commissionAgentsOwedTotal(){
   return state.partners.reduce((a,p)=> a + (partnerTotalEarnings(p) - payoutsTotal('partner', p.id)), 0);
 }
-function totalProfitAllSales(){ return state.sales.reduce((a,s)=> a + (s.staged ? 0 : (s.profit||0)), 0); }
+function totalProfitAllSales(){ return state.sales.reduce((a,s)=> a + (s.staged ? 0 : saleProfitAfterReturns(s)), 0); }
 // the FULL commission expense incurred so far (earned, whether or not it's
 // been paid out yet) — kept for Commission Agents Owed / Payable Due cards
 // and the Partners page; no longer part of the Trade Summary formula (see
@@ -2042,8 +2119,8 @@ function totalCommissionNewAll(){ return totalCommissionEarnedAll() - totalCommi
 // a cost of current trading — but current commission and expenses are real
 // deductions. Historical (staged) entries stay excluded, same as every
 // other Stock/Cash/Profit figure in the app.
-function totalSalesValueAll(){ return state.sales.reduce((a,s)=> a + (s.staged?0:Number(s.total)), 0); }
-function totalPurchasesValueAll(){ return state.purchases.reduce((a,p)=> a + (p.staged?0:Number(p.total)), 0); }
+function totalSalesValueAll(){ return state.sales.reduce((a,s)=> a + (s.staged?0:saleNetTotal(s)), 0); }
+function totalPurchasesValueAll(){ return state.purchases.reduce((a,p)=> a + (p.staged?0:purchaseNetTotal(p)), 0); }
 // Gross Profit (sum of each sale's own profit — cost matched to the
 // specific batch actually sold) instead of Total Sales − Total Purchases.
 // The old formula subtracted the FULL cost of everything ever bought, so
@@ -2171,9 +2248,9 @@ function netWorthTimeline(){
   };
   state.sales.forEach(s=>{
     if(s.staged || s.profit===undefined) return;
-    touch(s.date, 'profit', Number(s.profit)||0);
+    touch(s.date, 'profit', saleProfitAfterReturns(s));
     if(s.partnerId){
-      touch(s.date, 'commission', Math.max(0, Number(s.profit)||0) * ((Number(s.partnerPercent)||0)/100));
+      touch(s.date, 'commission', saleCommissionAfterReturns(s));
     }
   });
   state.expenses.filter(e=>!e.excludeFromProfit).forEach(e=> touch(e.date, 'expenses', Number(e.amount)));
@@ -2216,14 +2293,20 @@ function tradeSummaryPeriodFigures(period){
     const ym = todayStr().slice(0,7);
     const monthSales = state.sales.filter(s=>!s.staged && s.date && s.date.startsWith(ym));
     const monthPurch = state.purchases.filter(p=>!p.staged && p.date && p.date.startsWith(ym));
-    const sales = monthSales.reduce((a,s)=>a+Number(s.total),0);
-    const purchases = monthPurch.reduce((a,p)=>a+Number(p.total),0);
+    // Round 19 Bug 4: same return-adjusted helpers as the all-time totals
+    // (saleNetTotal/saleProfitAfterReturns/saleCommissionAfterReturns), just
+    // scoped to sales/purchases dated this month — a return against one of
+    // THOSE sales reduces this month's figures the same way it reduces the
+    // all-time ones, regardless of which day in the month the return itself
+    // landed on.
+    const sales = monthSales.reduce((a,s)=>a+saleNetTotal(s),0);
+    const purchases = monthPurch.reduce((a,p)=>a+purchaseNetTotal(p),0);
     // Gross Profit from items actually sold this month — not Sales minus
     // Purchases, same reasoning as tradeSummaryProfit() above.
-    const grossProfit = monthSales.reduce((a,s)=> a + (s.staged || s.profit===undefined ? 0 : Number(s.profit)), 0);
+    const grossProfit = monthSales.reduce((a,s)=> a + (s.staged || s.profit===undefined ? 0 : saleProfitAfterReturns(s)), 0);
     const expenses = state.expenses.filter(e=>!e.excludeFromProfit && e.date && e.date.startsWith(ym)).reduce((a,e)=>a+Number(e.amount),0);
     const miscIncome = state.miscIncome.filter(m=>!m.excludeFromProfit && m.date && m.date.startsWith(ym)).reduce((a,m)=>a+Number(m.amount),0);
-    const commissionNew = monthSales.reduce((a,s)=> a + (s.profit!==undefined && s.partnerId ? Math.max(0, Number(s.profit))*((Number(s.partnerPercent)||0)/100) : 0), 0);
+    const commissionNew = monthSales.reduce((a,s)=> a + saleCommissionAfterReturns(s), 0);
     return { sales, purchases, grossProfit, expenses, miscIncome, profit: grossProfit-commissionNew-expenses+miscIncome, commissionNew, commissionOpening: totalCommissionOpeningAll(), periodLabel: ym };
   }
   return { sales: totalSalesValueAll(), purchases: totalPurchasesValueAll(), grossProfit: totalProfitAllSales(), expenses: totalExpensesAll(), miscIncome: totalMiscIncomeAll(), profit: tradeSummaryProfit(), commissionNew: totalCommissionNewAll(), commissionOpening: totalCommissionOpeningAll(), periodLabel: 'All Time' };
@@ -3791,7 +3874,19 @@ function renderSupplierLedger(main, ro){
   const paidTotal = supplierPaymentsTotal(ledgerSupplier);
   const pending = supplierPendingTotal(ledgerSupplier);
   const advance = supplierAdvanceBalance(ledgerSupplier);
-  const supplierPaymentsList = state.supplierPayments.filter(p=>p.supplier===ledgerSupplier).slice().reverse();
+  // Round 19 Bug 2: a completed advance's own contribution to a purchase was
+  // invisible in Payments History ("No payments recorded yet" even though
+  // real money left the bank) — merge it in as its own kind of history row,
+  // sorted alongside real payments by date.
+  const advancePaymentRows = state.purchaseAdvances.filter(a=>a.status==='completed' && a.supplier===ledgerSupplier).map(a=>{
+    const p = state.purchases.find(x=>x.id===a.purchaseId);
+    const purchaseNet = p ? Math.max(0, Number(p.total) - purchaseReturnsTotal(p.id)) : Number(a.amount);
+    const appliedToPurchase = Math.min(Number(a.amount), purchaseNet);
+    return {kind:'advance', date:a.date, amount:appliedToPurchase, account:a.account, purchase:p};
+  });
+  const supplierPaymentsList = state.supplierPayments.filter(p=>p.supplier===ledgerSupplier).map(p=>({kind:'payment', date:p.date, payment:p}))
+    .concat(advancePaymentRows)
+    .sort((a,b)=> a.date<b.date?1:a.date>b.date?-1:0);
   main.innerHTML = `
     <section class="block">
       <h2>All Suppliers — Balances</h2>
@@ -3832,9 +3927,22 @@ function renderSupplierLedger(main, ro){
       <table>
         <thead><tr><th>Date</th><th>Item</th><th>Qty</th><th>Total</th><th>Paid</th><th>Outstanding</th><th>Status</th></tr></thead>
         <tbody>
-          ${rows.map(r=>`
-            <tr><td>${fmtDate(r.purchase.date)}</td><td>${r.purchase.item}</td><td>${fmtQty(r.purchase.qty)} ${r.purchase.unit||'kg'}</td><td>Rs ${fmt(r.purchase.total)}</td><td>Rs ${fmt(r.paid)}</td><td>Rs ${fmt(Number(r.purchase.total)-r.paid)}</td>
-            <td>${r.status==='clear'?'<span class="pill ok">Clear</span>':r.status==='partial'?'<span class="pill partial">Partially Paid</span>':(r.purchase.type==='cash'?'<span class="pill cash">Cash</span>':'<span class="pill credit">Payable</span>')}</td></tr>`).join('') || `<tr><td colspan="7" class="empty">No purchases for this supplier</td></tr>`}
+          ${rows.map(r=>{
+            // Round 19 Bug 2: "Paid" previously only ever showed the pool-
+            // applied portion (r.paid), so a purchase fully settled by its
+            // OWN linked advance showed "Paid Rs 0 / Outstanding Rs <full
+            // total>" even though real money (the advance) already covered
+            // it — the numbers didn't add up to the Pending Balance anywhere
+            // else on screen. Folding the advance's own contribution in here
+            // keeps Paid+Outstanding = Total−Returns, matching every other
+            // total on this page.
+            const purchaseNet = Math.max(0, Number(r.purchase.total) - purchaseReturnsTotal(r.purchase.id));
+            const advanceApplied = Math.min(purchaseAdvanceAppliedFor(r.purchase.id), purchaseNet);
+            const totalPaid = advanceApplied + r.paid;
+            const outstanding = r.effectiveTotal - r.paid;
+            return `<tr><td>${fmtDate(r.purchase.date)}</td><td>${r.purchase.item}</td><td>${fmtQty(r.purchase.qty)} ${r.purchase.unit||'kg'}</td><td>Rs ${fmt(r.purchase.total)}</td><td>Rs ${fmt(totalPaid)}</td><td>Rs ${fmt(outstanding)}</td>
+            <td>${r.status==='clear'?'<span class="pill ok">Clear</span>':r.status==='partial'?'<span class="pill partial">Partially Paid</span>':(r.purchase.type==='cash'?'<span class="pill cash">Cash</span>':'<span class="pill credit">Payable</span>')}</td></tr>`;
+          }).join('') || `<tr><td colspan="7" class="empty">No purchases for this supplier</td></tr>`}
         </tbody>
       </table>
       </div>
@@ -3845,9 +3953,16 @@ function renderSupplierLedger(main, ro){
       <table>
         <thead><tr><th>Date</th><th>Amount</th><th>Paid From</th><th>Note</th>${ro?'':'<th></th>'}</tr></thead>
         <tbody>
-          ${supplierPaymentsList.map(p=>`
-            <tr><td>${fmtDate(p.date)}</td><td>Rs ${fmt(p.amount)}</td><td>${p.staged ? '<span class="pill role" title="Entered during Historical Data Entry Mode — reduces the payable immediately, but permanently excluded from Cash/Bank">Historical</span>' : ((allAccounts().find(a=>a.id===(p.account||'cash'))||{}).name||'Cash')}</td><td>${p.note||'—'}</td>
-            ${ro?'':`<td class="row-actions"><button class="btn danger" data-spedit="${p.id}">Edit</button><button class="btn danger" data-spdelete="${p.id}">Delete</button></td>`}</tr>`).join('') || `<tr><td colspan="5" class="empty">No payments recorded yet</td></tr>`}
+          ${supplierPaymentsList.map(row=>{
+            if(row.kind==='advance'){
+              const a = row;
+              const purchaseNote = a.purchase ? `Advance applied — against purchase of ${fmtDate(a.purchase.date)} (${a.purchase.item})` : 'Advance applied';
+              return `<tr><td>${fmtDate(a.date)}</td><td>Rs ${fmt(a.amount)}</td><td>${((allAccounts().find(x=>x.id===(a.account||'cash'))||{}).name||'Cash')}</td><td><span class="pill role" title="Money left the bank when the Supplier Advance was issued — this is how much of it this purchase actually used">${purchaseNote}</span></td>${ro?'':'<td></td>'}</tr>`;
+            }
+            const p = row.payment;
+            return `<tr><td>${fmtDate(p.date)}</td><td>Rs ${fmt(p.amount)}</td><td>${p.staged ? '<span class="pill role" title="Entered during Historical Data Entry Mode — reduces the payable immediately, but permanently excluded from Cash/Bank">Historical</span>' : ((allAccounts().find(a=>a.id===(p.account||'cash'))||{}).name||'Cash')}</td><td>${p.note||'—'}</td>
+            ${ro?'':`<td class="row-actions"><button class="btn danger" data-spedit="${p.id}">Edit</button><button class="btn danger" data-spdelete="${p.id}">Delete</button></td>`}</tr>`;
+          }).join('') || `<tr><td colspan="5" class="empty">No payments recorded yet</td></tr>`}
         </tbody>
       </table>
       </div>
@@ -4748,8 +4863,19 @@ function renderInvestors(main){
   });
   main.querySelectorAll('[data-delinv]').forEach(b=>{
     b.onclick=async()=>{
-      if(!await showConfirm('Delete this investor? This cannot be undone.')) return;
+      // Round 19 Bug 8: deleting an investor used to leave their payouts
+      // behind as orphans (the money was still correctly accounted for in
+      // Cash/Bank — payoutsTotal doesn't care whether the investor record
+      // still exists — but each row showed "(removed)" forever with no way
+      // to clean it up from here). Now a single confirm makes the cascade
+      // explicit instead of a surprise: decline it and NOTHING is deleted.
+      const linkedPayouts = state.payouts.filter(p=>p.recipientType==='investor' && p.recipientId===b.dataset.delinv);
+      const msg = linkedPayouts.length
+        ? `Delete this investor? This also permanently deletes their ${linkedPayouts.length} payout record${linkedPayouts.length>1?'s':''} (Rs ${fmtPlain(linkedPayouts.reduce((a,p)=>a+Number(p.amount),0))} total) — otherwise they'd be left behind as orphaned "(removed)" entries. This cannot be undone.`
+        : 'Delete this investor? This cannot be undone.';
+      if(!await showConfirm(msg)) return;
       try{
+        for(const p of linkedPayouts) await api('DELETE','/api/payouts/'+p.id);
         await api('DELETE','/api/investors/'+b.dataset.delinv);
         if(editingInvestorId===b.dataset.delinv) editingInvestorId = null;
         await refreshState();
@@ -5008,8 +5134,17 @@ function renderPartners(main){
     const agentRec = state.partners.find(p=>p.id===recipientId);
     if(agentRec){
       const owed = partnerTotalEarnings(agentRec) - payoutsTotal('partner', agentRec.id);
-      if(amount > owed){
-        if(!await showConfirm(`This agent is only owed Rs ${fmtPlain(owed)}, but you're paying Rs ${fmtPlain(amount)} — Rs ${fmtPlain(amount-owed)} more than owed. Continue anyway?`)) return;
+      // Round 19 Bug 6: a bare "Continue anyway?" let an agent be paid more
+      // than they'd actually earned, with no record of the overage anywhere
+      // (unlike a Buyer/Supplier overpayment, which becomes a tracked
+      // Advance). Rather than build a parallel advance system for a future
+      // commission that isn't guaranteed to exist, this is a hard block —
+      // consistent with every other real money-leaving-the-account check in
+      // this app (assertFundsAvailable etc.), none of which are "continue
+      // anyway" confirms either.
+      if(amount > owed + 0.009){
+        await showAlert(`This agent is only owed Rs ${fmtPlain(owed)} — Rs ${fmtPlain(amount)} would overpay them by Rs ${fmtPlain(amount-owed)}. Reduce the amount, or wait until more commission is earned.`);
+        return;
       }
     }
     const funding = await resolveShortfallMulti({ date, account, total: amount, getAvailable: accountBalance, prefix:'pp', main });
@@ -5130,8 +5265,16 @@ function renderPersonalLoans(main){
   enableEnterNav(main.querySelector('#pl_lender').closest('section'), '#pl_add');
   main.querySelectorAll('[data-delloan]').forEach(b=>{
     b.onclick = async()=>{
-      if(!await showConfirm('Delete this personal loan record? This cannot be undone.')) return;
+      // Round 19 Bug 8: same fix as deleting an Investor above — make the
+      // cascade explicit in one confirm instead of leaving repayment rows
+      // behind as orphaned "(removed)" entries.
+      const linkedPayouts = state.payouts.filter(p=>p.recipientType==='loan' && p.recipientId===b.dataset.delloan);
+      const msg = linkedPayouts.length
+        ? `Delete this personal loan record? This also permanently deletes its ${linkedPayouts.length} repayment record${linkedPayouts.length>1?'s':''} (Rs ${fmtPlain(linkedPayouts.reduce((a,p)=>a+Number(p.amount),0))} total) — otherwise they'd be left behind as orphaned "(removed)" entries. This cannot be undone.`
+        : 'Delete this personal loan record? This cannot be undone.';
+      if(!await showConfirm(msg)) return;
       try{
+        for(const p of linkedPayouts) await api('DELETE','/api/payouts/'+p.id);
         await api('DELETE','/api/personal-loans/'+b.dataset.delloan);
         await refreshState();
         showToast('Personal loan deleted');
@@ -5157,8 +5300,14 @@ function renderPersonalLoans(main){
     const loanRec = state.personalLoans.find(l=>l.id===recipientId);
     if(loanRec){
       const owed = personalLoanOutstanding(loanRec);
-      if(amount > owed){
-        if(!await showConfirm(`Only Rs ${fmtPlain(owed)} is outstanding on this loan, but you're paying Rs ${fmtPlain(amount)} — Rs ${fmtPlain(amount-owed)} more than owed. Continue anyway?`)) return;
+      // Round 19 Bug 6: same hard-block policy as the Commission Agent
+      // overpayment check above — a bare "Continue anyway?" let a loan be
+      // repaid past what was actually outstanding with no record of the
+      // overage anywhere (a repaid-beyond-zero loan has no natural "next
+      // loan" to carry an advance forward into, unlike a Buyer/Supplier).
+      if(amount > owed + 0.009){
+        await showAlert(`Only Rs ${fmtPlain(owed)} is outstanding on this loan — Rs ${fmtPlain(amount)} would overpay it by Rs ${fmtPlain(amount-owed)}. Reduce the amount to at most what's outstanding.`);
+        return;
       }
     }
     const funding = await resolveShortfallMulti({ date, account, total: amount, getAvailable: accountBalance, prefix:'plp', main });
@@ -5356,9 +5505,9 @@ function renderReports(main){
   const ym = todayStr().slice(0,7);
   const monthSales = state.sales.filter(s=>!s.staged && s.date && s.date.startsWith(ym));
   const monthPurch = state.purchases.filter(p=>!p.staged && p.date && p.date.startsWith(ym));
-  const salesTotal = monthSales.reduce((a,s)=>a+Number(s.total),0);
-  const purchTotal = monthPurch.reduce((a,p)=>a+Number(p.total),0);
-  const monthProfit = monthSales.reduce((a,s)=>a+(Number(s.profit)||0),0);
+  const salesTotal = monthSales.reduce((a,s)=>a+saleNetTotal(s),0);
+  const purchTotal = monthPurch.reduce((a,p)=>a+purchaseNetTotal(p),0);
+  const monthProfit = monthSales.reduce((a,s)=>a+saleProfitAfterReturns(s),0);
   const bbc = booksBalanceCheck();
   const bbcOk = Math.abs(bbc.difference) < 1;
   const nwt = netWorthTimeline();
