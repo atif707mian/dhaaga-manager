@@ -5209,6 +5209,10 @@ function renderPersonalLoans(main){
   const ro = !canEditActiveClient();
   const loanPayouts = state.payouts.filter(p=>p.recipientType==='loan').slice().reverse();
   const totalOutstanding = totalPersonalLoansOutstanding();
+  const byDateAsc = (a,b)=> (a.date<b.date?-1:a.date>b.date?1:0);
+  const activeLoans = state.personalLoans.filter(l=>personalLoanOutstanding(l)>0.009).slice().sort(byDateAsc);
+  const paidOffLoans = state.personalLoans.filter(l=>personalLoanOutstanding(l)<=0.009).slice().sort(byDateAsc);
+  const recentLoans = state.personalLoans.slice().sort(byDateAsc).slice(-10).reverse();
   main.innerHTML = `
     <div class="cards">
       <div class="card ${totalOutstanding>0?'warn':''}"><div class="label">Personal Loans Outstanding</div><div class="value">Rs ${fmt(totalOutstanding)}</div></div>
@@ -5227,17 +5231,18 @@ function renderPersonalLoans(main){
       <div class="settings-note" style="margin-top:10px;">Use this when a person puts in cash on the spot to cover a shortfall — it counts toward that account's balance immediately, but is tracked here as a debt owed back to them, separate from Total Investment. Repay it as soon as funds allow.</div>
     </section>`}
     <section class="block">
-      <h2>Personal Loans List</h2>
+      <h2>Active Personal Loans</h2>
+      <div class="save-note" style="margin-bottom:12px;">Still outstanding, oldest first. Once a loan is fully paid back it moves to "Paid-Off Loans" below and drops out of this list and the Pay Back Loan dropdown.</div>
       <div style="overflow-x:auto;">
       <table>
         <thead><tr><th>Lender</th><th>Date</th><th>Amount</th><th>Deposited Into</th><th>Shortfall For</th><th>Paid Back</th><th>Outstanding</th>${ro?'':'<th></th>'}</tr></thead>
         <tbody>
-          ${state.personalLoans.map(l=>{
+          ${activeLoans.map(l=>{
             const paidOut = payoutsTotal('loan', l.id);
             const outstanding = personalLoanOutstanding(l);
             const fundedFor = personalLoanFundedTransaction(l.id);
             return `<tr><td>${l.lender}</td><td>${fmtDate(l.date)}</td><td>Rs ${fmt(l.amount)}</td><td>${(allAccounts().find(a=>a.id===(l.account||'cash'))||{}).name||'Cash'}</td><td>${fundedFor||'—'}</td><td>Rs ${fmt(paidOut)}</td><td>Rs ${fmt(outstanding)}</td>
-          ${ro?'':`<td class="row-actions"><button class="btn danger" data-delloan="${l.id}">Remove</button></td>`}</tr>`;}).join('') || `<tr><td colspan="8" class="empty">No personal loans recorded yet</td></tr>`}
+          ${ro?'':`<td class="row-actions"><button class="btn gold" data-payloan="${l.id}">Pay Loan</button><button class="btn danger" data-delloan="${l.id}">Remove</button></td>`}</tr>`;}).join('') || `<tr><td colspan="8" class="empty">No active personal loans — nothing outstanding right now</td></tr>`}
         </tbody>
       </table>
       </div>
@@ -5246,7 +5251,7 @@ function renderPersonalLoans(main){
     <section class="block">
       <h2>Pay Back Loan</h2>
       <div class="form-grid">
-        <div><label>Loan</label><select id="plp_loan">${state.personalLoans.map(l=>`<option value="${l.id}">${l.lender} — Rs ${fmtPlain(personalLoanOutstanding(l))} outstanding</option>`).join('') || '<option value="">— no loans —</option>'}</select></div>
+        <div><label>Loan</label><select id="plp_loan">${activeLoans.map(l=>`<option value="${l.id}">${l.lender} (${fmtDate(l.date)}) — Rs ${fmtPlain(personalLoanOutstanding(l))} outstanding</option>`).join('') || '<option value="">— no active loans —</option>'}</select></div>
         <div><label>Date</label><input type="date" id="plp_date" value="${todayStr()}"></div>
         <div><label>Amount</label><input type="number" id="plp_amount" placeholder="e.g. 50000"></div>
         <div><label>Paid From</label><select id="plp_account">${accountOptionsHtml('cash')}</select></div>
@@ -5267,6 +5272,38 @@ function renderPersonalLoans(main){
       </table>
       </div>
     </section>`}
+    <section class="block">
+      <h2>Recent Loan History <span style="color:var(--ink-soft);font-weight:400;">(last 10, any status)</span></h2>
+      <div style="overflow-x:auto;">
+      <table>
+        <thead><tr><th>Lender</th><th>Date</th><th>Amount</th><th>Deposited Into</th><th>Shortfall For</th><th>Paid Back</th><th>Outstanding</th><th>Status</th></tr></thead>
+        <tbody>
+          ${recentLoans.map(l=>{
+            const paidOut = payoutsTotal('loan', l.id);
+            const outstanding = personalLoanOutstanding(l);
+            const fundedFor = personalLoanFundedTransaction(l.id);
+            return `<tr><td>${l.lender}</td><td>${fmtDate(l.date)}</td><td>Rs ${fmt(l.amount)}</td><td>${(allAccounts().find(a=>a.id===(l.account||'cash'))||{}).name||'Cash'}</td><td>${fundedFor||'—'}</td><td>Rs ${fmt(paidOut)}</td><td>Rs ${fmt(outstanding)}</td><td>${outstanding<=0.009?'<span class="pill ok">Paid Off</span>':'<span class="pill credit">Outstanding</span>'}</td></tr>`;
+          }).join('') || `<tr><td colspan="8" class="empty">No personal loans recorded yet</td></tr>`}
+        </tbody>
+      </table>
+      </div>
+    </section>
+    <section class="block">
+      <h2>Paid-Off Loans <span style="color:var(--ink-soft);font-weight:400;">(full history, oldest first)</span></h2>
+      <div style="overflow-x:auto;">
+      <table>
+        <thead><tr><th>Lender</th><th>Date</th><th>Amount</th><th>Deposited Into</th><th>Shortfall For</th><th>Paid Back</th>${ro?'':'<th></th>'}</tr></thead>
+        <tbody>
+          ${paidOffLoans.map(l=>{
+            const paidOut = payoutsTotal('loan', l.id);
+            const fundedFor = personalLoanFundedTransaction(l.id);
+            return `<tr><td>${l.lender}</td><td>${fmtDate(l.date)}</td><td>Rs ${fmt(l.amount)}</td><td>${(allAccounts().find(a=>a.id===(l.account||'cash'))||{}).name||'Cash'}</td><td>${fundedFor||'—'}</td><td>Rs ${fmt(paidOut)}</td>
+          ${ro?'':`<td class="row-actions"><button class="btn danger" data-delloan="${l.id}">Remove</button></td>`}</tr>`;
+          }).join('') || `<tr><td colspan="7" class="empty">No personal loans have been fully paid off yet</td></tr>`}
+        </tbody>
+      </table>
+      </div>
+    </section>
   `;
   if(ro) return;
   main.querySelector('#pl_add').onclick = async()=>{
@@ -5310,6 +5347,21 @@ function renderPersonalLoans(main){
   );
   main.querySelector('#plp_amount').addEventListener('input', updateLoanPayFunding);
   main.querySelector('#plp_account').addEventListener('change', updateLoanPayFunding);
+  // inline "Pay Loan" on an Active Loans row — jumps straight to Pay Back
+  // Loan with this exact loan and its full outstanding amount pre-filled,
+  // so picking the account (Paid From) to pay it from is the only thing
+  // left to decide.
+  main.querySelectorAll('[data-payloan]').forEach(b=>{
+    b.onclick = ()=>{
+      const loan = state.personalLoans.find(l=>l.id===b.dataset.payloan);
+      if(!loan) return;
+      main.querySelector('#plp_loan').value = loan.id;
+      main.querySelector('#plp_amount').value = personalLoanOutstanding(loan);
+      updateLoanPayFunding();
+      plpForm.scrollIntoView({behavior:'smooth', block:'start'});
+      main.querySelector('#plp_account').focus();
+    };
+  });
   main.querySelector('#plp_add').onclick = guardDoubleSubmit('plp_add', async()=>{
     const recipientId = main.querySelector('#plp_loan').value;
     const date = main.querySelector('#plp_date').value;
