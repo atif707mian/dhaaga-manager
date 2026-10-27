@@ -495,11 +495,17 @@ function fmtQty(n){ return `<b>${fmtQtyPlain(n)}</b>`; }
 // compared/sorted, or used in periodMatches()/date-range filtering — all
 // of those need the raw YYYY-MM-DD string, which sorts and compares
 // correctly as plain text; DD-MM-YY does not.
+const DATE_MONTHS_SHORT = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 function fmtDate(d){
   if(!d) return '—';
   const m = String(d).match(/^(\d{4})-(\d{2})-(\d{2})/);
   if(!m) return String(d);
-  return `${m[3]}-${m[2]}-${m[1].slice(2)}`;
+  // Non-breaking spaces (not regular ones) between the day/month/year so a
+  // narrow table column can never wrap this onto two lines — plain text
+  // still (no markup), since this same function's output is also written
+  // directly onto a <canvas> via fillText() for the downloaded reports,
+  // where an HTML tag would show up as literal garbled text.
+  return `${Number(m[3])} ${DATE_MONTHS_SHORT[Number(m[2])-1]} ${m[1].slice(2)}`;
 }
 // same DD-MM-YY date, plus a time — for a generation timestamp or similar.
 // Never use toLocaleString()/toLocaleDateString() directly for anything
@@ -1910,7 +1916,10 @@ function partyRecoverySummary(){
     if(amount<=0) return;
     if(!byParty[name]) byParty[name] = {name, overdue:0, dueSoon:0};
     if(days < 0) byParty[name].overdue += amount;
-    else if(days <= 3) byParty[name].dueSoon += amount;
+    // was hardcoded to 3 regardless of the real configurable setting
+    // (Settings > Credit Recovery Reminder — days before), unlike
+    // reminderAlerts() right below, which already reads it correctly.
+    else if(days <= state.settings.creditReminderDays) byParty[name].dueSoon += amount;
   };
   state.sales.filter(s=>s.type==='credit' && s.dueDate).forEach(s=>{
     const outstanding = creditSaleOutstanding(s);
@@ -2203,16 +2212,23 @@ function booksBalanceCheck(){
   const expenses = totalExpensesAll();
   const commissionNew = totalCommissionNewAll();
   const investorPayouts = state.payouts.filter(p=>p.recipientType==='investor').reduce((a,p)=>a+Number(p.amount),0);
-  // Method B is the same Investment + Gross Profit − Expenses − Investor
-  // Payouts formula as the Net Worth Growth cards/chart above — kept
-  // identical everywhere a "current net worth" figure appears. A real
-  // withdrawal reduces Method A's actual Cash/Bank the moment it happens,
-  // so it must reduce this total too, or every payout would show up as a
-  // false "unexplained" gap (QA: found 2026-10-19 — a Rs 21,930 investor
-  // withdrawal showed as an unexplained Rs 21,930 gap before this fix).
-  // Opening Net Worth and Commission Earned (new) are still surfaced below
-  // as informational breakdown rows, but no longer folded into the total.
-  const methodB = investmentLive + profit - expenses - investorPayouts;
+  // Method B is the same Investment + Gross Profit − Expenses − Commission
+  // (new) − Investor Payouts formula as the Net Worth Growth cards/chart
+  // above — kept identical everywhere a "current net worth" figure appears.
+  // A real withdrawal reduces Method A's actual Cash/Bank the moment it
+  // happens, so it must reduce this total too, or every payout would show
+  // up as a false "unexplained" gap (QA: found 2026-10-19 — a Rs 21,930
+  // investor withdrawal showed as an unexplained Rs 21,930 gap before that
+  // fix). Commission works the same way: commissionNew was always computed
+  // above and shown as an informational row, but never actually subtracted
+  // here — so Method A correctly treated a new commission-bearing sale as
+  // an immediate liability (via commissionOwed) while Method B treated it
+  // as if it cost nothing, permanently drifting the two apart by the full
+  // running commission total every time a NEW such sale was recorded (QA:
+  // found 2026-10-27 — MA Traders, Rs 19,067 unexplained gap). Subtracting
+  // it here closes that gap for good, for every future commission-bearing
+  // sale, not just the one that exposed it.
+  const methodB = investmentLive + profit - expenses - commissionNew - investorPayouts;
   // informational only, not part of either method: money currently sitting
   // in a Locker account. A transfer that moves cash OUT of Cash/Bank INTO a
   // Locker (or vice versa) is invisible to Method B (transfers are equity-
@@ -2266,19 +2282,23 @@ function netWorthTimeline(){
   // Starting Position is the total investment historically fed into the
   // system (see Reports > Net Worth Growth cards) — every investor's capital
   // counts here as one lump sum regardless of its date, so the chart always
-  // starts exactly where the cards say it should. Commission is still
-  // tracked per month below for reference only (already netted out of each
-  // sale's own profit); Investor Payouts DOES move the running total — a
-  // real withdrawal reduces actual Cash/Bank the moment it happens, so it
-  // must reduce this too, or every payout looks like an unexplained gap
-  // (QA 2026-10-19). Running total = Investment + Gross Profit − Expenses
-  // − Investor Payouts = Current Net Worth, same as the cards above.
+  // starts exactly where the cards say it should. Commission was tracked
+  // per month below but NOT actually subtracted from the running total —
+  // the same gap found in booksBalanceCheck()'s Method B (see its comment
+  // for the full story: a commission-bearing sale was a real liability on
+  // the Method A side but cost nothing here, permanently drifting the two
+  // apart). Investor Payouts DOES move the running total — a real
+  // withdrawal reduces actual Cash/Bank the moment it happens, so it must
+  // reduce this too, or every payout looks like an unexplained gap (QA
+  // 2026-10-19). Running total = Investment + Gross Profit − Commission
+  // (new) − Expenses − Investor Payouts = Current Net Worth, same as the
+  // cards above.
   const startingValue = bbc.b.investmentLive;
   const points = [{ym:'Start', value:startingValue, delta:0, profit:0, commission:0, expenses:0, investorPayouts:0}];
   let running = startingValue;
   months.forEach(ym=>{
     const b = buckets[ym] || {profit:0, commission:0, expenses:0, investorPayouts:0};
-    const delta = b.profit - b.expenses - b.investorPayouts;
+    const delta = b.profit - b.commission - b.expenses - b.investorPayouts;
     running += delta;
     points.push({ym, value:running, delta, ...b});
   });
@@ -2428,10 +2448,11 @@ function drawBooksBalanceCheckCanvas(bbc){
   }
 
   // ---- Upper portion: Method B ----
-  sectionHeading('Method B — Investment + Gross Profit − Expenses − Investor Payouts');
+  sectionHeading('Method B — Investment + Gross Profit − Expenses − Commission − Investor Payouts');
   row('Total Investment', 'Rs ' + fmtPlain(bbc.b.investmentLive));
   row('+ Gross Profit (from sales)', 'Rs ' + fmtPlain(bbc.b.profit));
   row('− Expenses', 'Rs ' + fmtPlain(bbc.b.expenses));
+  row('− Commission Agents (new)', 'Rs ' + fmtPlain(bbc.b.commissionNew));
   row('− Paid Out to Investors', 'Rs ' + fmtPlain(bbc.b.investorPayouts));
   divider();
   row('= Method B Total', 'Rs ' + fmtPlain(bbc.methodB), {bold:true, size:23, gap:44});
@@ -2963,7 +2984,7 @@ function renderDashboard(main){
             <div class="recovery-box-name">${v.name}</div>
             <div class="recovery-box-split">
               <div class="recovery-box-cell due-soon">
-                <div class="recovery-box-label">Due Soon (≤3 days)</div>
+                <div class="recovery-box-label">Due Soon (${state.settings.creditReminderDays} ${state.settings.creditReminderDays===1?'Day':'Days'} Left)</div>
                 <div class="recovery-box-amount">${v.dueSoon>0?'Rs '+fmt(v.dueSoon):'—'}</div>
               </div>
               <div class="recovery-box-cell overdue">
@@ -5525,22 +5546,23 @@ function renderReports(main){
     </div>
     <section class="block">
       <h2>Net Worth Growth</h2>
-      <div class="save-note" style="margin-bottom:12px;">Starting Position is the total investment historically fed into the system. Gross Profit and Expenses are added/subtracted, and any amount paid out to investors is subtracted, to arrive at today's Current Net Worth.</div>
+      <div class="save-note" style="margin-bottom:12px;">Starting Position is the total investment historically fed into the system. Gross Profit is added; Expenses, Commission owed to agents on new sales, and any amount paid out to investors are subtracted, to arrive at today's Current Net Worth.</div>
       <div class="cards">
         <div class="card"><div class="label">Starting Position (Investment)</div><div class="value">Rs ${fmt(nwt.investment)}</div></div>
         <div class="card"><div class="label">Gross Profit</div><div class="value">Rs ${fmt(bbc.b.profit)}</div></div>
         <div class="card"><div class="label">Expenses</div><div class="value">Rs ${fmt(bbc.b.expenses)}</div></div>
+        <div class="card"><div class="label">Commission Agents (new)</div><div class="value">Rs ${fmt(bbc.b.commissionNew)}</div></div>
         <div class="card"><div class="label">Investor Payouts</div><div class="value">Rs ${fmt(bbc.b.investorPayouts)}</div></div>
         <div class="card"><div class="label">Current Net Worth</div><div class="value">Rs ${fmt(nwt.points.length?nwt.points[nwt.points.length-1].value:nwt.startingValue)}</div></div>
       </div>
       ${netWorthChartSVG(nwt.points, nwt.investment)}
       <div style="overflow-x:auto;margin-top:10px;">
       <table>
-        <thead><tr><th>Month</th><th>Gross Profit</th><th>Expenses</th><th>Investor Payouts</th><th>Net Change</th><th>Running Total</th><th title="Informational only — already netted out of each sale's profit, not part of the running total">Commission (info)</th></tr></thead>
+        <thead><tr><th>Month</th><th>Gross Profit</th><th>Expenses</th><th>Commission</th><th>Investor Payouts</th><th>Net Change</th><th>Running Total</th></tr></thead>
         <tbody>
           ${nwt.points.map(p=>{
-            if(p.ym==='Start') return `<tr style="background:var(--gold-soft);"><td>Starting Position (Investment)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>Rs ${fmt(p.value)}</td><td>—</td></tr>`;
-            return `<tr ${p.delta<0?'style="background:#FEF2F2;"':''}><td>${fmtMonthLabel(p.ym)}</td><td>Rs ${fmt(p.profit)}</td><td>${p.expenses>0?'−Rs '+fmt(p.expenses):'—'}</td><td>${p.investorPayouts>0?'−Rs '+fmt(p.investorPayouts):'—'}</td><td>${p.delta>=0?'+':'−'}Rs ${fmt(Math.abs(p.delta))}</td><td>Rs ${fmt(p.value)}</td><td>${p.commission>0?'Rs '+fmt(p.commission):'—'}</td></tr>`;
+            if(p.ym==='Start') return `<tr style="background:var(--gold-soft);"><td>Starting Position (Investment)</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td><td>Rs ${fmt(p.value)}</td></tr>`;
+            return `<tr ${p.delta<0?'style="background:#FEF2F2;"':''}><td>${fmtMonthLabel(p.ym)}</td><td>Rs ${fmt(p.profit)}</td><td>${p.expenses>0?'−Rs '+fmt(p.expenses):'—'}</td><td>${p.commission>0?'−Rs '+fmt(p.commission):'—'}</td><td>${p.investorPayouts>0?'−Rs '+fmt(p.investorPayouts):'—'}</td><td>${p.delta>=0?'+':'−'}Rs ${fmt(Math.abs(p.delta))}</td><td>Rs ${fmt(p.value)}</td></tr>`;
           }).join('')}
         </tbody>
       </table>
@@ -5556,27 +5578,27 @@ function renderReports(main){
       <div class="settings-note" style="margin-bottom:12px;">${!fsApiSupported() ? 'Your browser doesn\'t support choosing a save folder, so downloads go to your default Downloads folder (use Chrome or Edge for folder selection).' : fsSavedDirName ? `Saving to folder: <b>${fsSavedDirName}</b> (same folder used for Trade Summary and Investor Summary) — each save gets its own time-stamped file, so nothing is overwritten. Won't show in Chrome's Downloads list (saved directly); use "Change Save Location" to pick a different folder.` : 'No folder chosen yet — the first save will ask where to save, then remember it.'}</div>
       <div class="cards">
         <div class="card"><div class="label">Method A — Today's Balances</div><div class="value">Rs ${fmt(bbc.methodA)}</div></div>
-        <div class="card"><div class="label">Method B — Investment + Gross Profit − Expenses</div><div class="value">Rs ${fmt(bbc.methodB)}</div></div>
+        <div class="card"><div class="label">Method B — Investment + Gross Profit − Expenses − Commission</div><div class="value">Rs ${fmt(bbc.methodB)}</div></div>
         <div class="card ${bbcOk?'':'warn'}"><div class="label">Difference</div><div class="value">${bbcOk?'<span class="pill ok">✓ Balanced</span>':`<span class="pill due">Rs ${fmt(Math.abs(bbc.difference))} ${bbc.difference>0?'unexplained surplus':'unexplained gap'}</span>`}</div></div>
         ${bbc.lockerTotal>0?`<div class="card"><div class="label">Currently in Lockers</div><div class="value">Rs ${fmt(bbc.lockerTotal)}</div></div>`:''}
       </div>
       ${(!bbcOk && bbc.lockerTotal>0 && Math.abs(Math.abs(bbc.difference)-bbc.lockerTotal)<1) ? `<div class="settings-note" style="margin-top:-4px;margin-bottom:12px;">This gap is exactly the amount currently sitting in Lockers — it means a Transfer has moved that much money between a tracked account and a Locker. Lockers are excluded from both methods on purpose (see note below), so this is expected, not an error.</div>` : ''}
       <div style="overflow-x:auto;">
       <table>
-        <thead><tr><th>Method A — Today's Balances</th><th>Amount</th><th>Method B — Investment + Gross Profit − Expenses − Investor Payouts</th><th>Amount</th></tr></thead>
+        <thead><tr><th>Method A — Today's Balances</th><th>Amount</th><th>Method B — Investment + Gross Profit − Expenses − Commission − Investor Payouts</th><th>Amount</th></tr></thead>
         <tbody>
           <tr><td>Cash + Bank Balances <span style="color:var(--ink-soft);font-weight:400;">(same figure as the Dashboard's "Total Funds" card — Lockers excluded until their cash is actually moved out)</span></td><td>Rs ${fmt(bbc.a.cashAndBanks)}</td><td>Total Investment</td><td>Rs ${fmt(bbc.b.investmentLive)}</td></tr>
           <tr><td>+ Stock Value <span style="color:var(--ink-soft);font-weight:400;">(incl. Purchases on Hold — Supplier Advances)</span></td><td>Rs ${fmt(bbc.a.stock)}</td><td>+ Gross Profit (from sales)</td><td>Rs ${fmt(bbc.b.profit)}</td></tr>
           <tr><td>+ Credit Recovery Due</td><td>Rs ${fmt(bbc.a.receivable)}</td><td>− Expenses</td><td>Rs ${fmt(bbc.b.expenses)}</td></tr>
-          <tr><td>+ Supplier Advance</td><td>Rs ${fmt(bbc.a.supplierAdvances)}</td><td>− Paid Out to Investors</td><td>Rs ${fmt(bbc.b.investorPayouts)}</td></tr>
-          <tr><td>− Payable Due</td><td>Rs ${fmt(bbc.a.payable)}</td><td></td><td></td></tr>
+          <tr><td>+ Supplier Advance</td><td>Rs ${fmt(bbc.a.supplierAdvances)}</td><td>− Commission Agents (new)</td><td>Rs ${fmt(bbc.b.commissionNew)}</td></tr>
+          <tr><td>− Payable Due</td><td>Rs ${fmt(bbc.a.payable)}</td><td>− Paid Out to Investors</td><td>Rs ${fmt(bbc.b.investorPayouts)}</td></tr>
           <tr><td>− Commission Agents Owed</td><td>Rs ${fmt(bbc.a.commissionOwed)}</td><td></td><td></td></tr>
           <tr><td>− Personal Loans Outstanding</td><td>Rs ${fmt(bbc.a.loansOutstanding)}</td><td></td><td></td></tr>
           <tr><td>− Buyer Advance</td><td>Rs ${fmt(bbc.a.buyerAdvances)}</td><td></td><td></td></tr>
           <tr><td>− Suspense Account <span style="color:var(--ink-soft);font-weight:400;">(manual, one-time plug entry)</span></td><td>Rs ${fmt(bbc.a.suspenseAccount)}</td><td></td><td></td></tr>
           <tr style="font-weight:700;background:var(--gold-soft);"><td>= Method A Total</td><td>Rs ${fmt(bbc.methodA)}</td><td>= Method B Total</td><td>Rs ${fmt(bbc.methodB)}</td></tr>
         </tbody>
-        <tfoot><tr style="color:var(--ink-soft);font-size:12px;"><td colspan="4">Informational only (not part of either total): Opening Net Worth (day one) Rs ${fmt(bbc.b.openingNetWorth)} · Commission Earned (new) Rs ${fmt(bbc.b.commissionNew)}</td></tr></tfoot>
+        <tfoot><tr style="color:var(--ink-soft);font-size:12px;"><td colspan="4">Informational only (not part of either total): Opening Net Worth (day one) Rs ${fmt(bbc.b.openingNetWorth)}</td></tr></tfoot>
       </table>
       </div>
     </section>
