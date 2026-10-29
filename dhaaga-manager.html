@@ -1473,7 +1473,14 @@ function fundingCoverOptionsHtml(excludeIds, getAvailable, shortfall, currentVal
     const bal = getAvailable(a.id);
     return `<option value="${a.id}" ${a.id===currentValue?'selected':''}>${a.name} (Rs ${fmtPlain(bal)} available${bal<shortfall?' — not enough alone':''})</option>`;
   }).join('');
-  return `<option value="" ${!currentValue?'selected':''}>— choose an account —</option>` + opts + `<option value="__loan__" ${currentValue==='__loan__'?'selected':''}>Personal Loan (enter lender name)</option>`;
+  // QA: a user who already had real money sitting in an account from an
+  // earlier, separate Personal Loan picked this option expecting to spend
+  // that SAME loan's money — but this always creates a BRAND NEW loan for
+  // whatever's still short (there is no way to "reuse" an existing one;
+  // once its money lands in an account it's just that account's ordinary
+  // balance, spendable directly with no special step at all). "New" makes
+  // that unambiguous.
+  return `<option value="" ${!currentValue?'selected':''}>— choose an account —</option>` + opts + `<option value="__loan__" ${currentValue==='__loan__'?'selected':''}>New Personal Loan (enter lender name)</option>`;
 }
 // Wires a 2-round "Cover Shortfall From" chain — a shortfall bigger than any
 // single account needs two (occasionally three, counting the primary)
@@ -1554,7 +1561,7 @@ async function resolveShortfallMulti({date, account, total, getAvailable, prefix
     if(!r.wrap || r.wrap.style.display==='none') break;
     const val = r.sel.value;
     if(!val){
-      await showAlert(`${accName} is short by Rs ${fmtPlain(remaining)}. Choose an account — or Personal Loan — under "Cover Shortfall From" to cover the difference.`);
+      await showAlert(`${accName} is short by Rs ${fmtPlain(remaining)}. Choose an account — or New Personal Loan — under "Cover Shortfall From" to cover the difference.`);
       return null;
     }
     if(val==='__loan__'){ loanTriggered = true; break; }
@@ -1569,7 +1576,7 @@ async function resolveShortfallMulti({date, account, total, getAvailable, prefix
   let lenderName = '';
   if(remaining>0.009){
     if(!loanTriggered){
-      await showAlert(`${accName} is still short by Rs ${fmtPlain(remaining)} even after the selected account(s). Choose Personal Loan to cover the rest, or pick a larger account.`);
+      await showAlert(`${accName} is still short by Rs ${fmtPlain(remaining)} even after the selected account(s). Choose New Personal Loan to cover the rest, or pick a larger account.`);
       return null;
     }
     lenderName = main.querySelector(`#${prefix}_lender_name`).value;
@@ -4464,7 +4471,7 @@ function chequeEntrySectionHtml(ro){
       <table>
         <thead><tr><th>Date</th><th>Direction</th><th>Party</th><th>Bank</th><th>Amount</th><th>Due Date</th><th>Status</th>${ro?'':'<th></th>'}</tr></thead>
         <tbody>
-          ${state.cheques.slice().reverse().map(c=>{
+          ${state.cheques.slice().sort((a,b)=> (a.dueDate<b.dueDate?-1:a.dueDate>b.dueDate?1:0)).map(c=>{
             // same overdue/due-soon row coloring as "Clear a Pending Cheque"
             // (Financial Entry → Payment) — only for still-Pending cheques,
             // since a Cleared one is already resolved and due-date no
