@@ -3303,6 +3303,23 @@ app.delete('/api/personal-loans/:id', ...editorAccess, async (req, res) => {
       const r = await db.query('SELECT * FROM personal_loans WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       if (!r.rows[0]) return false;
       const old = r.rows[0];
+      // Same overdraft risk as deleting a Transfer (Round 19 Bug 5), just
+      // missed there — a Personal Loan deposits real money into an account
+      // the moment it's recorded; deleting the loan un-does that deposit.
+      // If that money has already been spent (a purchase, an expense,
+      // another payout), the account goes negative with no warning. Real
+      // incident: MA Traders deleted two "Swift" loans (Rs 1,780,000 into
+      // Faysal 3815, Rs 3,000,000 into Faysal 4540) after already spending
+      // from both — both accounts went negative with nothing to stop it.
+      const accId = old.account_id || 'cash';
+      const balanceIncludingThisLoan = await computeAccountBalanceDb(db, req.clientId, accId);
+      const balanceAfterDelete = balanceIncludingThisLoan - Number(old.amount);
+      if (balanceAfterDelete < -0.009) {
+        const accName = accId === 'cash' ? 'Cash' : (await db.query('SELECT name FROM bank_accounts WHERE id=$1 AND client_id=$2', [accId, req.clientId])).rows[0]?.name || 'That account';
+        const e = new Error(`Deleting this loan would take ${accName} to Rs ${balanceAfterDelete.toFixed(2)} (short by Rs ${Math.abs(balanceAfterDelete).toFixed(2)}) — its money has already been spent elsewhere. Delete or edit whatever used it first, then this loan.`);
+        e.code = 'INSUFFICIENT_FUNDS';
+        throw e;
+      }
       await db.query('DELETE FROM personal_loans WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       await writeAudit(db, req.clientId, 'personal_loan', 'delete', { entry: { date: old.date, lender: old.lender, amount: old.amount, account: old.account_id, note: old.note } });
       return true;
@@ -3310,6 +3327,7 @@ app.delete('/api/personal-loans/:id', ...editorAccess, async (req, res) => {
     if (!found) return res.status(404).json({ error: 'Personal loan not found' });
     res.json({ ok: true });
   } catch (err) {
+    if (err.code === 'INSUFFICIENT_FUNDS') return res.status(400).json({ error: err.message });
     console.error('DELETE /api/personal-loans/:id error:', err);
     res.status(500).json({ error: 'Unable to delete personal loan' });
   }
