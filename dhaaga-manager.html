@@ -5588,6 +5588,8 @@ function renderReports(main){
   const salesTotal = monthSales.reduce((a,s)=>a+saleNetTotal(s),0);
   const purchTotal = monthPurch.reduce((a,p)=>a+purchaseNetTotal(p),0);
   const monthProfit = monthSales.reduce((a,s)=>a+saleProfitAfterReturns(s),0);
+  const pendingParties = partyNames().filter(p=>partyPendingTotal(p)>0).map(name=>({name, amount:partyPendingTotal(name)}));
+  const pendingSuppliers = supplierNames().filter(s=>supplierPendingTotal(s)>0).map(name=>({name, amount:supplierPendingTotal(name)}));
   const bbc = booksBalanceCheck();
   const bbcOk = Math.abs(bbc.difference) < 1;
   const nwt = netWorthTimeline();
@@ -5666,13 +5668,17 @@ function renderReports(main){
         <h2>This Month's Sales (${monthSales.length})</h2>
         <table><tbody>
           ${monthSales.map(s=>`<tr><td>${fmtDate(s.date)}</td><td>${s.party}</td><td>Rs ${fmt(s.total)}</td></tr>`).join('') || '<tr><td class="empty">No entries</td></tr>'}
-        </tbody></table>
+        </tbody>
+        ${monthSales.length ? `<tfoot><tr style="font-weight:700;background:var(--gold-soft);"><td colspan="2">Total</td><td>Rs ${fmt(monthSales.reduce((a,s)=>a+Number(s.total),0))}</td></tr></tfoot>` : ''}
+        </table>
       </section>
       <section class="block">
         <h2>This Month's Purchases (${monthPurch.length})</h2>
         <table><tbody>
           ${monthPurch.map(p=>`<tr><td>${fmtDate(p.date)}</td><td>${p.supplier}</td><td>Rs ${fmt(p.total)}</td></tr>`).join('') || '<tr><td class="empty">No entries</td></tr>'}
-        </tbody></table>
+        </tbody>
+        ${monthPurch.length ? `<tfoot><tr style="font-weight:700;background:var(--gold-soft);"><td colspan="2">Total</td><td>Rs ${fmt(monthPurch.reduce((a,p)=>a+Number(p.total),0))}</td></tr></tfoot>` : ''}
+        </table>
       </section>
     </div>
     <div class="two-col">
@@ -5682,8 +5688,9 @@ function renderReports(main){
         <table>
           <thead><tr><th>Buyer</th><th>Pending Balance</th></tr></thead>
           <tbody>
-            ${partyNames().filter(p=>partyPendingTotal(p)>0).map(p=>`<tr><td>${p}</td><td>Rs ${fmt(partyPendingTotal(p))}</td></tr>`).join('') || '<tr><td colspan="2" class="empty">Nothing pending</td></tr>'}
+            ${pendingParties.map(p=>`<tr><td>${p.name}</td><td>Rs ${fmt(p.amount)}</td></tr>`).join('') || '<tr><td colspan="2" class="empty">Nothing pending</td></tr>'}
           </tbody>
+          ${pendingParties.length ? `<tfoot><tr style="font-weight:700;background:var(--gold-soft);"><td>Total</td><td>Rs ${fmt(pendingParties.reduce((a,p)=>a+p.amount,0))}</td></tr></tfoot>` : ''}
         </table>
         </div>
       </section>
@@ -5693,8 +5700,9 @@ function renderReports(main){
         <table>
           <thead><tr><th>Supplier</th><th>Pending Balance</th></tr></thead>
           <tbody>
-            ${supplierNames().filter(s=>supplierPendingTotal(s)>0).map(s=>`<tr><td>${s}</td><td>Rs ${fmt(supplierPendingTotal(s))}</td></tr>`).join('') || '<tr><td colspan="2" class="empty">Nothing pending</td></tr>'}
+            ${pendingSuppliers.map(s=>`<tr><td>${s.name}</td><td>Rs ${fmt(s.amount)}</td></tr>`).join('') || '<tr><td colspan="2" class="empty">Nothing pending</td></tr>'}
           </tbody>
+          ${pendingSuppliers.length ? `<tfoot><tr style="font-weight:700;background:var(--gold-soft);"><td>Total</td><td>Rs ${fmt(pendingSuppliers.reduce((a,s)=>a+s.amount,0))}</td></tr></tfoot>` : ''}
         </table>
         </div>
       </section>
