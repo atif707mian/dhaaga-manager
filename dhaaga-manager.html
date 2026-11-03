@@ -5873,7 +5873,7 @@ function renderReports(main){
       <table>
         <thead><tr><th>Date</th><th>Type</th><th>Description</th><th>Amount</th><th>Balance</th></tr></thead>
         <tbody>
-          ${accountLedgerRows(reportsAccount).map(r=>`<tr><td>${fmtDate(r.date)}</td><td>${r.kind}</td><td>${r.desc||'—'}</td><td style="color:${r.amount<0?'var(--danger,#c0392b)':'inherit'};">${r.amount<0?'-':'+'}Rs ${fmt(Math.abs(r.amount))}</td><td>Rs ${fmt(r.balance)}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">No transactions yet</td></tr>'}
+          ${accountLedgerRows(reportsAccount).slice().reverse().map(r=>`<tr><td>${fmtDate(r.date)}</td><td>${r.kind}</td><td>${r.desc||'—'}</td><td style="color:${r.amount<0?'var(--danger,#c0392b)':'inherit'};">${r.amount<0?'-':'+'}Rs ${fmt(Math.abs(r.amount))}</td><td>Rs ${fmt(r.balance)}</td></tr>`).join('') || '<tr><td colspan="5" class="empty">No transactions yet</td></tr>'}
         </tbody>
       </table>
       </div>
