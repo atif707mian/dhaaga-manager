@@ -1677,14 +1677,26 @@ function partyReceiptsTotal(party){
   return state.receipts.filter(r=>r.party===party).reduce((a,r)=>a+Number(r.amount),0);
 }
 // a return (either settlement) always means less was actually kept, so it
-// shrinks THIS specific sale's own effective total — never a generic
-// addition to the receipts pool, which would let it get FIFO-applied
-// against some OTHER, unrelated sale for the same party. A refund-settled
-// return additionally moves cash (see accountBalance); a credit-settled
-// return needs nothing further, since the smaller total already reduces
-// what's owed on its own.
+// reduces REVENUE/profit/stock the same way regardless of how the
+// difference was paid back — use this for anything measuring what was
+// actually sold (Sales Trend, Total Sales Value, the "Returned" display
+// column, COGS). Never use this for what the party still OWES — see
+// saleCreditReturnsTotal below for that; QA Round 23, Item 3 traced a
+// Books Balance Check gap to exactly this mix-up.
 function saleReturnsTotal(saleId){
   return state.salesReturns.filter(r=>r.saleId===saleId).reduce((a,r)=>a+Number(r.total),0);
+}
+// receivable purposes only. A refund-settled return is a pure cash event —
+// double-entry credits Cash, never Accounts Receivable, so what the party
+// owes is untouched by it (any gap it leaves against what they already
+// paid is exactly why POST /api/sales-returns caps a refund at what was
+// actually received — see that handler). Only a credit-settled return
+// actually credits Accounts Receivable, i.e. reduces what's owed. Mixing
+// refund-settled returns into the receivable side double-counted them —
+// once here, once as the real cash leaving via accountBalance — which is
+// the Books Balance Check gap QA Round 23's Item 3 found.
+function saleCreditReturnsTotal(saleId){
+  return state.salesReturns.filter(r=>r.saleId===saleId && r.settlement==='credit').reduce((a,r)=>a+Number(r.total),0);
 }
 function purchaseReturnsTotal(purchaseId){
   return state.purchaseReturns.filter(r=>r.purchaseId===purchaseId).reduce((a,r)=>a+Number(r.total),0);
@@ -1706,7 +1718,7 @@ function purchaseAdvanceAppliedFor(purchaseId){
 // rows, unlike accountBalance/recomputeStockItem/totalProfitAllSales etc.
 function partyCreditSalesTotal(party){
   return state.sales.filter(s=>s.party===party && s.type==='credit')
-    .reduce((a,s)=>a+Math.max(0, Number(s.total)-saleReturnsTotal(s.id)),0);
+    .reduce((a,s)=>a+Math.max(0, Number(s.total)-saleCreditReturnsTotal(s.id)),0);
 }
 // opening balance is what this party already owed before using this app —
 // same principle as a bank account's opening_balance being the base that
@@ -1810,7 +1822,7 @@ function partyLedgerRows(party){
     // matters if it's refund-settled (handled by accountBalance) — a
     // 'credit' settlement is blocked server-side for exactly this case.
     if(s.type==='cash'){ return {sale:s, received:Number(s.total), status:'clear', effectiveTotal:Number(s.total)}; }
-    const total = Math.max(0, Number(s.total) - saleReturnsTotal(s.id));
+    const total = Math.max(0, Number(s.total) - saleCreditReturnsTotal(s.id));
     const applied = Math.min(pool, total);
     pool -= applied;
     const status = total<=0.009 ? 'clear' : (applied<=0 ? 'pending' : (applied<total ? 'partial' : 'clear'));
@@ -1856,7 +1868,7 @@ function creditSaleStatus(sale){
 function creditSaleOutstanding(sale){
   if(sale.type!=='credit') return 0;
   const row = partyLedgerRows(sale.party).find(r=>r.sale.id===sale.id);
-  return row ? row.effectiveTotal - row.received : Math.max(0, Number(sale.total)-saleReturnsTotal(sale.id));
+  return row ? row.effectiveTotal - row.received : Math.max(0, Number(sale.total)-saleCreditReturnsTotal(sale.id));
 }
 function creditDueTotal(){
   return partyNames().reduce((a,p)=>a + partyPendingTotal(p), 0);
@@ -3459,7 +3471,7 @@ function renderSales(main){
         <div><label>Date</label><input type="date" id="sr_date" value="${todayStr()}"></div>
         <div><label>Quantity Returned</label><input type="number" id="sr_qty" placeholder="e.g. 5"></div>
         <div><label>Settlement</label><select id="sr_settlement"><option value="refund">Refund (Cash/Bank)</option><option value="credit">Credit (reduce receivable)</option></select></div>
-        <div id="sr_acc_wrap"><label>Refund From</label><select id="sr_account">${accountOptionsHtml('cash')}</select></div>
+        <div id="sr_acc_wrap"><label>Refund From</label><select id="sr_account">${accountOptionsHtml(returnableList[0] ? (returnableList[0].account||'cash') : 'cash')}</select></div>
         <div><label>Note (optional)</label><input id="sr_note"></div>
       </div>
       <div class="settings-note" id="sr_hint" style="margin-bottom:12px;"></div>
@@ -3651,7 +3663,19 @@ function renderSales(main){
   if(srSaleSel){
     const srSettlementSel = main.querySelector('#sr_settlement');
     const srAccWrap = main.querySelector('#sr_acc_wrap');
+    const srAccountSel = main.querySelector('#sr_account');
     const srQty = main.querySelector('#sr_qty');
+    // QA Round 23, Item 7: "Refund From" always defaulted to Cash,
+    // regardless of which account the sale itself was actually paid into
+    // — a cash sale recorded into a bank account would then default its
+    // refund to Cash, which could be short even while the right account
+    // has plenty. Follow the sale's own account instead. Only resets when
+    // the SALE selection changes, never when just toggling Settlement, so
+    // a deliberate account choice isn't clobbered by flipping back and forth.
+    function updateSrAccountDefault(){
+      const sale = state.sales.find(x=>x.id===srSaleSel.value);
+      if(sale) srAccountSel.value = sale.account || 'cash';
+    }
     function updateSrHint(){
       const sale = state.sales.find(x=>x.id===srSaleSel.value);
       if(!sale) return;
@@ -3670,8 +3694,9 @@ function renderSales(main){
       srAccWrap.style.display = srSettlementSel.value==='refund' ? 'block' : 'none';
       srQty.placeholder = `Up to ${fmtQtyPlain(returnable)} ${sale.unit}`;
     }
-    srSaleSel.addEventListener('change', updateSrHint);
+    srSaleSel.addEventListener('change', ()=>{ updateSrAccountDefault(); updateSrHint(); });
     srSettlementSel.addEventListener('change', updateSrHint);
+    updateSrAccountDefault();
     updateSrHint();
     enableEnterNav(srSaleSel.closest('section'), '#sr_add');
     main.querySelector('#sr_add').onclick = guardDoubleSubmit('sr_add', async ()=>{
@@ -4336,7 +4361,16 @@ function renderPurchases(main){
         await showAlert('This purchase has a Purchase Return recorded against it — delete that return first, then this purchase.');
         return;
       }
-      if(purchase && purchase.type==='credit' && !purchase.paid){
+      // QA Round 23, Item 4: a purchase completed from its own Supplier
+      // Advance shows as "settled" here too (creditPurchaseOutstanding
+      // nets out purchaseAdvanceAppliedFor, same as the Ledger display),
+      // but that's the advance's own money, not a real FIFO-pooled
+      // payment — this pre-check has no way to tell the two apart, so it
+      // was reporting the full amount as "already paid" and blocking the
+      // delete before the request (which the server already allows — see
+      // the matching note on DELETE /api/purchases/:id) ever went out.
+      const linkedAdvance = purchase && state.purchaseAdvances.some(a=>a.status==='completed' && a.purchaseId===purchase.id);
+      if(purchase && purchase.type==='credit' && !purchase.paid && !linkedAdvance){
         const applied = Number(purchase.total) - creditPurchaseOutstanding(purchase);
         if(applied > 0.009){
           await showAlert(`Rs ${fmtPlain(applied)} has already been paid against this purchase (FIFO-applied from ${purchase.supplier}'s payments) — delete or edit that payment from the Ledger first, then this purchase.`);

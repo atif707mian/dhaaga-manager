@@ -1962,6 +1962,24 @@ app.post('/api/sales-returns', ...editorAccess, async (req, res) => {
       }
       const rate = Number(sale.rate);
       const total = Number(x.qty) * rate;
+      // QA Round 23, Item 3: a Refund on a credit sale paid real cash out
+      // even when the buyer hadn't paid anything toward it yet — the
+      // return and the receipts pool are tracked separately, so nothing
+      // before this connected "how much did they actually pay" to "how
+      // much can we hand back in cash." Cap the refund at that — same
+      // FIFO-applied figure the Party Ledger and the delete guard already
+      // use for this sale — and point them at Credit for the rest, same
+      // as the existing cash-sale guard just above does.
+      if (x.settlement === 'refund' && sale.type === 'credit') {
+        const applied = await partySaleFifoAppliedDb(db, req.clientId, sale.party, x.saleId);
+        const alreadyRefunded = Number((await db.query("SELECT COALESCE(SUM(total),0) s FROM sales_returns WHERE sale_id=$1 AND settlement='refund'", [x.saleId])).rows[0].s);
+        const refundable = applied - alreadyRefunded;
+        if (total > refundable + 0.009) {
+          const e = new Error(`Only Rs ${Math.max(0, refundable).toFixed(2)} of this sale can still be refunded (Rs ${applied.toFixed(2)} received so far${alreadyRefunded > 0.009 ? `, Rs ${alreadyRefunded.toFixed(2)} already refunded` : ''}) — a Refund can't pay out more than that. Use Credit instead (it reduces what they still owe), or reduce the quantity.`);
+          e.code = 'NEGATIVE_STOCK';
+          throw e;
+        }
+      }
       if (x.settlement === 'refund') await assertFundsAvailable(db, req.clientId, x.account, total);
       const id = crypto.randomUUID();
       const r = await db.query(
