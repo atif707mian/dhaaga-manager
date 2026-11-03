@@ -66,6 +66,18 @@ function requireAdmin(req, res, next) {
   if (req.session.user.role !== 'admin') return res.status(403).json({ error: 'Admin access required' });
   next();
 }
+// Money already paid out to an individual/entity (personal loan repayment,
+// investor payout, commission agent payout, supplier payment) can never be
+// deleted by a regular editor — only a global admin. Correcting a mistake
+// goes through Edit, not Delete. Call inside the withTenantDb callback so
+// the thrown error is caught by the route's existing catch block.
+function assertAdminDelete(req) {
+  if (req.session.user.role !== 'admin') {
+    const e = new Error('Only an admin can delete a payment that already moved money — ask an admin, or use Edit to correct it instead.');
+    e.code = 'ADMIN_REQUIRED';
+    throw e;
+  }
+}
 
 // resolves which client the request operates on (req.clientId) from the
 // caller's session. Must run after requireAuth, before any tenant-table query.
@@ -760,6 +772,8 @@ async function ensureSchema() {
     );
     ALTER TABLE audit_log DROP CONSTRAINT IF EXISTS audit_log_kind_check;
     ALTER TABLE audit_log ADD CONSTRAINT audit_log_kind_check CHECK (kind IN ('sale','purchase','investor','partner','bank','expense','cheque','receipt','payout','user','party','stock','supplier','supplier_payment','transfer','personal_loan','purchase_return','sale_return','purchase_advance','misc_income'));
+    ALTER TABLE audit_log DROP CONSTRAINT IF EXISTS audit_log_action_check;
+    ALTER TABLE audit_log ADD CONSTRAINT audit_log_action_check CHECK (action IN ('edit','delete','undo-clear'));
 
     -- Phase 1 SaaS prep: add client_id as a NULLABLE column to every business
     -- table. Nullable on purpose — existing rows have no client yet, and this
@@ -2529,6 +2543,15 @@ app.delete('/api/cheques/:id', ...editorAccess, async (req, res) => {
       const r = await db.query('SELECT * FROM cheques WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       if (!r.rows[0]) return false;
       const old = r.rows[0];
+      // A cleared payment cheque has already created a real supplier
+      // payment (money gone from the bank) — deleting it outright is the
+      // same protected action as DELETE /api/supplier-payments/:id, so it
+      // needs the same admin gate. A still-pending cheque has moved no
+      // money yet, and a cleared receipt cheque only ever created a
+      // receipt (money in, not a protected payment), so neither is gated.
+      // The ordinary path to reverse a cleared cheque is now
+      // POST /api/cheques/:id/undo-clear, which stays open to any editor.
+      if (old.direction === 'issued' && old.status === 'cleared') assertAdminDelete(req);
       // Round 20 Bug 7: clearing a payment cheque with "Cover Shortfall
       // From" auto-creates a transfer, linked via the supplier_payment's
       // own funding_transfer_ids — raw-deleting that payment here (instead
@@ -2559,9 +2582,50 @@ app.delete('/api/cheques/:id', ...editorAccess, async (req, res) => {
     if (!found) return res.status(404).json({ error: 'Cheque not found' });
     res.json({ ok: true });
   } catch (err) {
+    if (err.code === 'ADMIN_REQUIRED') return res.status(403).json({ error: err.message });
     if (err.code === 'HAS_PAYMENTS' || err.code === 'INSUFFICIENT_FUNDS') return res.status(400).json({ error: err.message });
     console.error('DELETE /api/cheques/:id error:', err);
     res.status(500).json({ error: 'Unable to delete cheque' });
+  }
+});
+
+// Reverses a cheque's own clear — back to Pending, its auto-created
+// receipt/payment removed — without deleting the cheque itself. This is the
+// ordinary, editor-level way to fix "cleared the wrong cheque by mistake"
+// immediately after the fact, as opposed to DELETE on an already-cleared
+// payment cheque (admin-only, since that payment is a protected one).
+app.post('/api/cheques/:id/undo-clear', ...editorAccess, async (req, res) => {
+  try {
+    const found = await withTenantDb(req.clientId, async (db) => {
+      const r = await db.query('SELECT * FROM cheques WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+      if (!r.rows[0]) return false;
+      const old = r.rows[0];
+      if (old.status !== 'cleared') {
+        const e = new Error('This cheque is not cleared');
+        e.code = 'NOT_CLEARED';
+        throw e;
+      }
+      // Same funding-link cleanup, and the same "run after the row whose
+      // money it's evaluating is gone" ordering, as DELETE
+      // /api/supplier-payments/:id and DELETE /api/cheques/:id above.
+      let paymentFunding = null;
+      if (old.payment_id) {
+        const paymentRow = await db.query('SELECT funding_transfer_ids, funding_loan_ids FROM supplier_payments WHERE id=$1 AND client_id=$2', [old.payment_id, req.clientId]);
+        if (paymentRow.rows[0]) paymentFunding = paymentRow.rows[0];
+      }
+      if (old.receipt_id) await db.query('DELETE FROM receipts WHERE id=$1 AND client_id=$2', [old.receipt_id, req.clientId]);
+      if (old.payment_id) await db.query('DELETE FROM supplier_payments WHERE id=$1 AND client_id=$2', [old.payment_id, req.clientId]);
+      await db.query("UPDATE cheques SET status='pending', payment_id=NULL, receipt_id=NULL WHERE id=$1 AND client_id=$2", [req.params.id, req.clientId]);
+      if (paymentFunding) await deleteFundingLinks(db, req.clientId, paymentFunding.funding_transfer_ids, paymentFunding.funding_loan_ids);
+      await writeAudit(db, req.clientId, 'cheque', 'undo-clear', { entry: { date: old.date, party: old.party, bank: old.bank, amount: old.amount } });
+      return true;
+    });
+    if (!found) return res.status(404).json({ error: 'Cheque not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.code === 'NOT_CLEARED' || err.code === 'HAS_PAYMENTS' || err.code === 'INSUFFICIENT_FUNDS') return res.status(400).json({ error: err.message });
+    console.error('POST /api/cheques/:id/undo-clear error:', err);
+    res.status(500).json({ error: 'Unable to undo clear' });
   }
 });
 
@@ -3271,6 +3335,10 @@ app.delete('/api/payouts/:id', ...editorAccess, async (req, res) => {
       const r = await db.query('SELECT * FROM payouts WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       if (!r.rows[0]) return false;
       const old = r.rows[0];
+      // Covers all three recipient types this table holds — investor
+      // payout, commission agent payout, personal loan repayment — every
+      // one of them is money already paid out, so every one is protected.
+      assertAdminDelete(req);
       await db.query('DELETE FROM payouts WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       // run after the payout's own row is gone — see the matching note on
       // DELETE /api/purchases/:id.
@@ -3281,6 +3349,7 @@ app.delete('/api/payouts/:id', ...editorAccess, async (req, res) => {
     if (!found) return res.status(404).json({ error: 'Payout not found' });
     res.json({ ok: true });
   } catch (err) {
+    if (err.code === 'ADMIN_REQUIRED') return res.status(403).json({ error: err.message });
     if (err.code === 'HAS_PAYMENTS' || err.code === 'INSUFFICIENT_FUNDS') return res.status(400).json({ error: err.message });
     console.error('DELETE /api/payouts/:id error:', err);
     res.status(500).json({ error: 'Unable to delete payout' });
@@ -3360,6 +3429,10 @@ app.delete('/api/supplier-payments/:id', ...editorAccess, async (req, res) => {
       const r = await db.query('SELECT * FROM supplier_payments WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       if (!r.rows[0]) return false;
       const old = r.rows[0];
+      // Money already paid to a supplier — protected. If this payment came
+      // from clearing a cheque, use POST /api/cheques/:id/undo-clear
+      // instead (editor-level, reverses the clear without this gate).
+      assertAdminDelete(req);
       await db.query('DELETE FROM supplier_payments WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       // run after the payment's own row is gone — see the matching note on
       // DELETE /api/purchases/:id.
@@ -3373,6 +3446,7 @@ app.delete('/api/supplier-payments/:id', ...editorAccess, async (req, res) => {
     if (!found) return res.status(404).json({ error: 'Supplier payment not found' });
     res.json({ ok: true });
   } catch (err) {
+    if (err.code === 'ADMIN_REQUIRED') return res.status(403).json({ error: err.message });
     if (err.code === 'HAS_PAYMENTS' || err.code === 'INSUFFICIENT_FUNDS') return res.status(400).json({ error: err.message });
     console.error('DELETE /api/supplier-payments/:id error:', err);
     res.status(500).json({ error: 'Unable to delete supplier payment' });

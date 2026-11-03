@@ -2174,12 +2174,28 @@ function booksBalanceCheck(){
   // same treatment totalFunds() already gives them on the Dashboard, so
   // this matches that figure instead of silently differing from it.
   const cashAndBanks = totalFunds();
-  // money issued as a Supplier Advance but not yet turned into actual stock
-  // (the purchase is still "on hold") is already gone from Cash/Bank — it
-  // has to count as an asset SOMEWHERE, or Method A would understate net
-  // worth by exactly that much. Counted alongside Stock Value since it's
-  // effectively inventory in progress.
-  const stock = stockValue() + pendingPurchaseAdvancesTotal();
+  // QA Round 22, Item 3: stockValue() prices every unit still held at the
+  // item's single blended average cost (same figure the Stock tab shows,
+  // and the only one that's meaningful for pricing a NEW sale going
+  // forward) — but Method B's profit is booked per-sale against the
+  // SPECIFIC purchase batch it was actually sold from (see POST
+  // /api/sales), which can differ from the blended average whenever an
+  // item has had more than one purchase rate. Both figures are individually
+  // correct for what they're each for; they just don't agree with each
+  // other once a return hands quantity back into a now-diluted average
+  // pool, re-pricing it at a rate that was never actually paid for those
+  // specific units. For THIS reconciliation only (not the Stock tab, not
+  // any other screen's costing), re-derive stock's value the same way
+  // Method B derives profit — opening value, plus every purchase net of
+  // its own returns, minus the COGS actually recognized by every sale net
+  // of ITS returns (saleNetTotal − saleProfitAfterReturns, i.e. revenue
+  // minus the profit already booked against it) — so both methods are
+  // built from the same per-batch cost basis and can never structurally
+  // disagree, with or without returns in the mix.
+  const openingStockValue = state.stock.reduce((a,s)=>a+(Number(s.openingQty)||0)*(Number(s.openingRate)||0),0);
+  const purchasesValueNetOfReturns = state.purchases.reduce((a,p)=> p.staged ? a : a + purchaseNetTotal(p), 0);
+  const cogsRecognized = state.sales.reduce((a,s)=> s.staged ? a : a + (saleNetTotal(s) - saleProfitAfterReturns(s)), 0);
+  const stock = (openingStockValue + purchasesValueNetOfReturns - cogsRecognized) + pendingPurchaseAdvancesTotal();
   // same figure as the Dashboard's "Total Recovery Due (Receivable)" card —
   // includes Historical (staged) credit sales too, so this always matches
   // what the rest of the app shows instead of silently differing from it.
@@ -2752,7 +2768,7 @@ function auditDisplay(kind, snap){
     case 'expense': return {date:snap.date, who:snap.desc, item:acctName(snap.account), qty:'—', rate:'—', total:'Rs '+fmt(snap.amount)};
     case 'cheque': return {date:snap.date, who:snap.party, item:snap.bank||'Cheque', qty:'—', rate:'—', total:'Rs '+fmt(snap.amount)};
     case 'receipt': return {date:snap.date, who:snap.party, item:snap.note||'Payment Received', qty:'—', rate:'—', total:'Rs '+fmt(snap.amount)};
-    case 'payout': return {date:snap.date, who:snap.recipientType==='investor'?'Investor Payment':'Agent Payment', item:snap.note||'—', qty:'—', rate:'—', total:'Rs '+fmt(snap.amount)};
+    case 'payout': return {date:snap.date, who:snap.recipientType==='investor'?'Investor Payment':snap.recipientType==='loan'?'Loan Repayment':'Agent Payment', item:snap.note||'—', qty:'—', rate:'—', total:'Rs '+fmt(snap.amount)};
     case 'user': return {date:'—', who:snap.username, item:snap.role==='admin'?'Admin':'View only', qty:'—', rate:'—', total:'—'};
     case 'party': case 'supplier': return {date:'—', who:snap.name, item:'Opening Balance', qty:'—', rate:'—', total:'Rs '+fmt(snap.openingBalance)};
     case 'stock': return {date:'—', who:snap.name, item:'Opening Stock', qty:`${fmtQty(snap.openingQty)} ${snap.unit||'kg'}`, rate:fmtQty(snap.openingRate), total:'—'};
@@ -3641,10 +3657,14 @@ function renderSales(main){
       if(!sale) return;
       const returnable = saleReturnableQty(sale.id);
       // 'credit' settlement only has something to reduce on a credit sale —
-      // same guard the server enforces (see POST /api/sales-returns) — so
-      // hide it here rather than let the user hit a confusing rejection.
+      // same guard the server enforces (see POST /api/sales-returns). QA
+      // Round 22, Item 7: disabled still left it sitting in the list,
+      // looking like a real choice on a cash sale (and "Record Return"
+      // just silently fell through to whatever the select's value already
+      // was) — hidden removes it from the list entirely, not just grey it out.
       const creditOpt = srSettlementSel.querySelector('option[value="credit"]');
       const creditMakesSense = sale.type==='credit';
+      creditOpt.hidden = !creditMakesSense;
       creditOpt.disabled = !creditMakesSense;
       if(!creditMakesSense && srSettlementSel.value==='credit') srSettlementSel.value = 'refund';
       srAccWrap.style.display = srSettlementSel.value==='refund' ? 'block' : 'none';
@@ -3788,12 +3808,19 @@ function renderBuyerLedger(main, ro){
       <h2>${ledgerParty} — Sales</h2>
       <div style="overflow-x:auto;">
       <table>
-        <thead><tr><th>Date</th><th>Item</th><th>Qty</th><th>Total</th><th>Received</th><th>Outstanding</th><th>Status</th><th>Due Date</th></tr></thead>
+        <thead><tr><th>Date</th><th>Item</th><th>Qty</th><th>Total</th><th>Returned</th><th>Received</th><th>Outstanding</th><th>Status</th><th>Due Date</th></tr></thead>
         <tbody>
-          ${rows.map(r=>`
-            <tr><td>${fmtDate(r.sale.date)}</td><td>${r.sale.item}</td><td>${fmtQty(r.sale.qty)} ${r.sale.unit||'kg'}</td><td>Rs ${fmt(r.sale.total)}</td><td>Rs ${fmt(r.received)}</td><td>Rs ${fmt(r.effectiveTotal-r.received)}</td>
+          ${rows.map(r=>{
+            // QA Round 22, Item 5: Total stayed the original sale amount
+            // even after a return, with no column explaining why Received
+            // + Outstanding no longer add back up to it — add the missing
+            // piece instead of shrinking Total itself (Outstanding already
+            // nets returns via r.effectiveTotal, unchanged here).
+            const returned = saleReturnsTotal(r.sale.id);
+            return `
+            <tr><td>${fmtDate(r.sale.date)}</td><td>${r.sale.item}</td><td>${fmtQty(r.sale.qty)} ${r.sale.unit||'kg'}</td><td>Rs ${fmt(r.sale.total)}</td><td>${returned>0.009?'Rs '+fmt(returned):'—'}</td><td>Rs ${fmt(r.received)}</td><td>Rs ${fmt(r.effectiveTotal-r.received)}</td>
             <td>${r.status==='clear'?'<span class="pill ok">Clear</span>':r.status==='partial'?'<span class="pill partial">Partially Received</span>':(r.sale.type==='cash'?'<span class="pill cash">Cash</span>':'<span class="pill credit">Pending</span>')}</td>
-            <td>${r.sale.type==='credit'?fmtDate(r.sale.dueDate):'—'}</td></tr>`).join('') || `<tr><td colspan="8" class="empty">No sales for this party</td></tr>`}
+            <td>${r.sale.type==='credit'?fmtDate(r.sale.dueDate):'—'}</td></tr>`;}).join('') || `<tr><td colspan="9" class="empty">No sales for this party</td></tr>`}
         </tbody>
       </table>
       </div>
@@ -4018,7 +4045,7 @@ function renderSupplierLedger(main, ro){
             }
             const p = row.payment;
             return `<tr><td>${fmtDate(p.date)}</td><td>Rs ${fmt(p.amount)}</td><td>${p.staged ? '<span class="pill role" title="Entered during Historical Data Entry Mode — reduces the payable immediately, but permanently excluded from Cash/Bank">Historical</span>' : ((allAccounts().find(a=>a.id===(p.account||'cash'))||{}).name||'Cash')}</td><td>${p.note||'—'}</td>
-            ${ro?'':`<td class="row-actions"><button class="btn danger" data-spedit="${p.id}">Edit</button><button class="btn danger" data-spdelete="${p.id}">Delete</button></td>`}</tr>`;
+            ${ro?'':`<td class="row-actions"><button class="btn danger" data-spedit="${p.id}">Edit</button>${isAdmin()?`<button class="btn danger" data-spdelete="${p.id}">Delete</button>`:''}</td>`}</tr>`;
           }).join('') || `<tr><td colspan="5" class="empty">No payments recorded yet</td></tr>`}
         </tbody>
       </table>
@@ -4343,6 +4370,10 @@ function renderPurchases(main){
         note = main.querySelector('#pa_note').value.trim();
       if(!supplier || !date || !amount){ await showAlert('Please fill all required fields'); return; }
       if(!isPositiveAmount(amount)){ await showAlert('Amount must be greater than zero'); return; }
+      // QA Round 22, Item 2: same known-supplier check as Misc. Income's
+      // supplier-credit mode — an advance to a name that doesn't exist yet
+      // left money leaving the bank with no real supplier to apply it to.
+      if(!supplierNames().some(n=>n.toLowerCase()===supplier.toLowerCase())){ await showAlert(`"${supplier}" is not a known supplier — pick one from the suggestions (it must already have a purchase or a Master Record entry).`); return; }
       const funding = await resolveShortfallMulti({ date, account, total: amount, getAvailable: paAvailable, prefix:'pa', main });
       if(!funding) return;
       const body = {date, supplier, amount, account, note, fundingTransferIds: funding.transferIds, fundingLoanIds: funding.loanIds};
@@ -4388,10 +4419,12 @@ function renderPurchases(main){
       const returnable = purchaseReturnableQty(purchase.id);
       // 'credit' settlement only has something to reduce on an unpaid
       // credit purchase — same guard the server enforces (see
-      // POST /api/purchase-returns) — so hide it here rather than let the
-      // user hit a confusing rejection after filling the whole form.
+      // POST /api/purchase-returns). QA Round 22, Item 7 (same fix as the
+      // mirror-image Sales Return form): hidden removes it from the list
+      // entirely instead of leaving it sitting there greyed out.
       const creditOpt = prSettlementSel.querySelector('option[value="credit"]');
       const creditMakesSense = purchase.type==='credit' && !purchase.paid;
+      creditOpt.hidden = !creditMakesSense;
       creditOpt.disabled = !creditMakesSense;
       if(!creditMakesSense && prSettlementSel.value==='credit') prSettlementSel.value = 'refund';
       prAccWrap.style.display = prSettlementSel.value==='refund' ? 'block' : 'none';
@@ -4517,7 +4550,10 @@ function chequeEntrySectionHtml(ro){
             <tr style="background:${rowBg};">
               <td>${fmtDate(c.date)}</td><td>${c.direction==='issued'?'<span class="pill credit">Payment</span>':'<span class="pill cash">Receipt</span>'}</td><td>${c.party}</td><td>${c.bank||'—'}</td><td>Rs ${fmt(c.amount)}</td><td>${fmtDate(c.dueDate)}</td>
               <td>${c.status==='pending' ? '<span class="pill due">Pending</span>' : '<span class="pill ok">Cleared</span>'}</td>
-              ${ro?'':`<td class="row-actions">${c.status==='pending'?`<button class="btn danger" data-cedit="${c.id}">Edit</button>`:''}<button class="btn danger" data-cdelete="${c.id}">Delete</button></td>`}
+              ${ro?'':`<td class="row-actions">${c.status==='pending'
+                ? `<button class="btn danger" data-cedit="${c.id}">Edit</button><button class="btn danger" data-cdelete="${c.id}">Delete</button>`
+                : `<button class="btn danger" data-cundo="${c.id}">Undo Clear</button>${(c.direction==='received'||isAdmin())?`<button class="btn danger" data-cdelete="${c.id}">Delete</button>`:''}`
+              }</td>`}
             </tr>`;}).join('') || `<tr><td colspan="8" class="empty">No cheques entered yet</td></tr>`}
         </tbody>
       </table>
@@ -4566,6 +4602,13 @@ function wireChequeEntrySection(main){
     b.onclick=async ()=>{
       if(!await showConfirm('Delete this cheque? This cannot be undone.')) return;
       try { await api('DELETE', '/api/cheques/'+b.dataset.cdelete); await refreshState(); showToast('Cheque deleted'); }
+      catch(e){ await showAlert(e.message); }
+    };
+  });
+  main.querySelectorAll('[data-cundo]').forEach(b=>{
+    b.onclick=async ()=>{
+      if(!await showConfirm('Undo this cheque\'s clearance? It goes back to Pending, and the payment/receipt it created is removed.')) return;
+      try { await api('POST', '/api/cheques/'+b.dataset.cundo+'/undo-clear'); await refreshState(); showToast('Clearance undone — cheque is Pending again'); }
       catch(e){ await showAlert(e.message); }
     };
   });
@@ -4893,7 +4936,7 @@ function renderInvestors(main){
       <table>
         <thead><tr><th>Date</th><th>Investor</th><th>Amount</th><th>Paid From</th><th>Note</th><th></th></tr></thead>
         <tbody>
-          ${investorPayouts.map(p=>`<tr><td>${fmtDate(p.date)}</td><td>${(state.investors.find(i=>i.id===p.recipientId)||{}).name||'(removed)'}</td><td>Rs ${fmt(p.amount)}</td><td>${(allAccounts().find(a=>a.id===(p.account||'cash'))||{}).name||'Cash'}</td><td>${p.note||'—'}</td><td class="row-actions"><button class="btn danger" data-editpayout="${p.id}">Edit</button><button class="btn danger" data-delpayout="${p.id}">Delete</button></td></tr>`).join('') || `<tr><td colspan="6" class="empty">No payments recorded yet</td></tr>`}
+          ${investorPayouts.map(p=>`<tr><td>${fmtDate(p.date)}</td><td>${(state.investors.find(i=>i.id===p.recipientId)||{}).name||'(removed)'}</td><td>Rs ${fmt(p.amount)}</td><td>${(allAccounts().find(a=>a.id===(p.account||'cash'))||{}).name||'Cash'}</td><td>${p.note||'—'}</td><td class="row-actions"><button class="btn danger" data-editpayout="${p.id}">Edit</button>${isAdmin()?`<button class="btn danger" data-delpayout="${p.id}">Delete</button>`:''}</td></tr>`).join('') || `<tr><td colspan="6" class="empty">No payments recorded yet</td></tr>`}
         </tbody>
       </table>
       </div>
@@ -5046,6 +5089,19 @@ function renderInvestors(main){
       if(!p) return;
       const edited = await editPayoutModal({title:'Edit Investor Payment', recipientLabel:'Investor', recipients:state.investors.map(i=>({id:i.id, name:i.name})), entry:p});
       if(!edited) return;
+      // QA Round 22, Item 1: Add blocks overpaying past what's owed, but
+      // Edit saved anything — same hard-block here, with the old amount
+      // (if this payment is staying on the same investor) added back to
+      // "owed" first, since that old amount is already counted against it.
+      const inv = state.investors.find(i=>i.id===edited.recipientId);
+      if(inv){
+        let owed = Number(inv.amount) + investorProfitShare(inv,'all') - investorExpenseShare(inv,'all') - payoutsTotal('investor', inv.id);
+        if(p.recipientId===edited.recipientId) owed += Number(p.amount);
+        if(Number(edited.amount) > owed + 0.009){
+          await showAlert(`This investor is only owed Rs ${fmtPlain(owed)} — Rs ${fmtPlain(edited.amount)} would overpay them by Rs ${fmtPlain(edited.amount-owed)}. Reduce the amount, or wait until more profit is earned.`);
+          return;
+        }
+      }
       try{
         await api('PATCH', '/api/payouts/'+p.id, edited);
         await refreshState();
@@ -5107,7 +5163,7 @@ function commissionLedgerHtml(){
             <td>${r.kind==='payout'?(r.payout.note||'—'):(r.party+' — '+r.item)}</td>
             <td style="color:${r.amount<0?'var(--danger,#c0392b)':'inherit'};">${r.amount<0?'-':'+'}Rs ${fmt(Math.abs(r.amount))}</td>
             <td>Rs ${fmt(r.balance)}</td>
-            ${ro?'':`<td class="row-actions">${r.kind==='payout'?`<button class="btn danger" data-editpayout="${r.payout.id}">Edit</button><button class="btn danger" data-delpayout="${r.payout.id}">Delete</button>`:''}</td>`}</tr>`).join('') || `<tr><td colspan="${ro?5:6}" class="empty">No commission or payments recorded yet</td></tr>`}
+            ${ro?'':`<td class="row-actions">${r.kind==='payout'?`<button class="btn danger" data-editpayout="${r.payout.id}">Edit</button>${isAdmin()?`<button class="btn danger" data-delpayout="${r.payout.id}">Delete</button>`:''}`:''}</td>`}</tr>`).join('') || `<tr><td colspan="${ro?5:6}" class="empty">No commission or payments recorded yet</td></tr>`}
         </tbody>
       </table>
       </div>
@@ -5165,7 +5221,7 @@ function renderPartners(main){
       <table>
         <thead><tr><th>Date</th><th>Agent</th><th>Amount</th><th>Paid From</th><th>Note</th><th></th></tr></thead>
         <tbody>
-          ${partnerPayouts.map(p=>`<tr><td>${fmtDate(p.date)}</td><td>${(state.partners.find(x=>x.id===p.recipientId)||{}).name||'(removed)'}</td><td>Rs ${fmt(p.amount)}</td><td>${(allAccounts().find(a=>a.id===(p.account||'cash'))||{}).name||'Cash'}</td><td>${p.note||'—'}</td><td class="row-actions"><button class="btn danger" data-editpayout="${p.id}">Edit</button><button class="btn danger" data-delpayout="${p.id}">Delete</button></td></tr>`).join('') || `<tr><td colspan="6" class="empty">No payments recorded yet</td></tr>`}
+          ${partnerPayouts.map(p=>`<tr><td>${fmtDate(p.date)}</td><td>${(state.partners.find(x=>x.id===p.recipientId)||{}).name||'(removed)'}</td><td>Rs ${fmt(p.amount)}</td><td>${(allAccounts().find(a=>a.id===(p.account||'cash'))||{}).name||'Cash'}</td><td>${p.note||'—'}</td><td class="row-actions"><button class="btn danger" data-editpayout="${p.id}">Edit</button>${isAdmin()?`<button class="btn danger" data-delpayout="${p.id}">Delete</button>`:''}</td></tr>`).join('') || `<tr><td colspan="6" class="empty">No payments recorded yet</td></tr>`}
         </tbody>
       </table>
       </div>
@@ -5254,6 +5310,17 @@ function renderPartners(main){
       if(!p) return;
       const edited = await editPayoutModal({title:'Edit Commission Agent Payment', recipientLabel:'Agent', recipients:state.partners.map(x=>({id:x.id, name:x.name})), entry:p});
       if(!edited) return;
+      // QA Round 22, Item 1: same Edit overpay gap as the Investor Payment
+      // handler above.
+      const agentRec = state.partners.find(x=>x.id===edited.recipientId);
+      if(agentRec){
+        let owed = partnerTotalEarnings(agentRec) - payoutsTotal('partner', agentRec.id);
+        if(p.recipientId===edited.recipientId) owed += Number(p.amount);
+        if(Number(edited.amount) > owed + 0.009){
+          await showAlert(`This agent is only owed Rs ${fmtPlain(owed)} — Rs ${fmtPlain(edited.amount)} would overpay them by Rs ${fmtPlain(edited.amount-owed)}. Reduce the amount, or wait until more commission is earned.`);
+          return;
+        }
+      }
       try{
         await api('PATCH', '/api/payouts/'+p.id, edited);
         await refreshState();
@@ -5339,7 +5406,7 @@ function renderPersonalLoans(main){
       <table>
         <thead><tr><th>Date</th><th>Lender</th><th>Amount</th><th>Paid From</th><th>Note</th><th></th></tr></thead>
         <tbody>
-          ${loanPayouts.map(p=>`<tr><td>${fmtDate(p.date)}</td><td>${(state.personalLoans.find(l=>l.id===p.recipientId)||{}).lender||'(removed)'}</td><td>Rs ${fmt(p.amount)}</td><td>${(allAccounts().find(a=>a.id===(p.account||'cash'))||{}).name||'Cash'}</td><td>${p.note||'—'}</td><td class="row-actions"><button class="btn danger" data-editpayout="${p.id}">Edit</button><button class="btn danger" data-delpayout="${p.id}">Delete</button></td></tr>`).join('') || `<tr><td colspan="6" class="empty">No repayments recorded yet</td></tr>`}
+          ${loanPayouts.map(p=>`<tr><td>${fmtDate(p.date)}</td><td>${(state.personalLoans.find(l=>l.id===p.recipientId)||{}).lender||'(removed)'}</td><td>Rs ${fmt(p.amount)}</td><td>${(allAccounts().find(a=>a.id===(p.account||'cash'))||{}).name||'Cash'}</td><td>${p.note||'—'}</td><td class="row-actions"><button class="btn danger" data-editpayout="${p.id}">Edit</button>${isAdmin()?`<button class="btn danger" data-delpayout="${p.id}">Delete</button>`:''}</td></tr>`).join('') || `<tr><td colspan="6" class="empty">No repayments recorded yet</td></tr>`}
         </tbody>
       </table>
       </div>
@@ -5469,6 +5536,17 @@ function renderPersonalLoans(main){
       if(!p) return;
       const edited = await editPayoutModal({title:'Edit Loan Repayment', recipientLabel:'Loan', recipients:state.personalLoans.map(l=>({id:l.id, name:l.lender})), entry:p});
       if(!edited) return;
+      // QA Round 22, Item 1: same Edit overpay gap as the Investor/Agent
+      // Payment handlers above.
+      const loanRec = state.personalLoans.find(l=>l.id===edited.recipientId);
+      if(loanRec){
+        let owed = personalLoanOutstanding(loanRec);
+        if(p.recipientId===edited.recipientId) owed += Number(p.amount);
+        if(Number(edited.amount) > owed + 0.009){
+          await showAlert(`Only Rs ${fmtPlain(owed)} is outstanding on this loan — Rs ${fmtPlain(edited.amount)} would overpay it by Rs ${fmtPlain(edited.amount-owed)}. Reduce the amount to at most what's outstanding.`);
+          return;
+        }
+      }
       try{
         await api('PATCH', '/api/payouts/'+p.id, edited);
         await refreshState();
