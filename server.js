@@ -777,6 +777,14 @@ async function ensureSchema() {
     ALTER TABLE receipts ADD COLUMN IF NOT EXISTS client_id TEXT;
     ALTER TABLE payouts ADD COLUMN IF NOT EXISTS client_id TEXT;
     ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS client_id TEXT;
+    -- Round 20 Bug 4: two agents (or two banks) with the same name could
+    -- both be created — Pay Commission Agent then can't tell them apart.
+    -- Parties/suppliers/materials already block a same-name duplicate;
+    -- these two never did. Case-insensitive, trimmed, same as the app-layer
+    -- check added alongside this (which is what actually produces the
+    -- friendly error — this index is only the race-safe backstop).
+    CREATE UNIQUE INDEX IF NOT EXISTS partners_client_name_ci_idx ON partners (client_id, LOWER(TRIM(name)));
+    CREATE UNIQUE INDEX IF NOT EXISTS bank_accounts_client_name_ci_idx ON bank_accounts (client_id, LOWER(TRIM(name)));
   `);
 }
 
@@ -1209,6 +1217,24 @@ async function deleteFundingLinks(db, clientId, fundingTransferIdsRaw, fundingLo
   }
   const transferIds = parseIdList(fundingTransferIdsRaw);
   if (transferIds.length) {
+    // Round 20 Bug 7: this deleted the auto-created shortfall-cover
+    // transfer with raw SQL, bypassing the SAME overdraft guard
+    // DELETE /api/transfers/:id enforces (Round 19 Bug 5) — every caller of
+    // deleteFundingLinks (cheques, purchases, expenses, payouts, supplier
+    // payments) could leave the transfer's TO account negative with no
+    // warning at all. Checked here once, so every caller is protected, not
+    // just the one QA happened to test (a cleared payment cheque).
+    const transfers = await db.query('SELECT id, to_account, amount FROM transfers WHERE client_id=$1 AND id = ANY($2::text[])', [clientId, transferIds]);
+    for (const t of transfers.rows) {
+      const toBalance = await computeAccountBalanceDb(db, clientId, t.to_account);
+      if (Number(t.amount) > toBalance + 0.009) {
+        const shortBy = fmtMoneyServer(Number(t.amount) - toBalance);
+        const toName = t.to_account === 'cash' ? 'Cash' : (await db.query('SELECT name FROM bank_accounts WHERE id=$1 AND client_id=$2', [t.to_account, clientId])).rows[0]?.name || 'that account';
+        const e = new Error(`Deleting this entry would also delete the auto-transfer that funded it, which would take ${toName} short by Rs ${shortBy} — its money has already been spent elsewhere. Delete or edit whatever used it first, then this entry.`);
+        e.code = 'INSUFFICIENT_FUNDS';
+        throw e;
+      }
+    }
     await db.query('DELETE FROM transfers WHERE client_id=$1 AND id = ANY($2::text[])', [clientId, transferIds]);
   }
   for (const loanId of loanIds) {
@@ -1761,6 +1787,27 @@ app.patch('/api/sales/:id', ...editorAccess, async (req, res) => {
       if (!before.rows[0]) return null;
       const old = before.rows[0];
       const total = Number(x.qty) * Number(x.rate);
+      // Round 20 Bug 2: editing a sale ignored its own Sales Returns
+      // entirely — shrinking the qty below what was already returned left a
+      // return bigger than the sale itself (negative remaining quantity),
+      // and changing the rate left every existing return still priced at
+      // the OLD rate, so Stock Value and the return's own total silently
+      // stopped matching the sale they came from. Simplest safe rule:
+      // block both while any return exists, rather than try to rewrite
+      // historical return rows to match.
+      const returnedQty = Number((await db.query('SELECT COALESCE(SUM(qty),0) s FROM sales_returns WHERE sale_id=$1', [req.params.id])).rows[0].s);
+      if (returnedQty > 0.001) {
+        if (Number(x.qty) < returnedQty - 0.001) {
+          const e = new Error(`${returnedQty} ${old.unit} has already been returned against this sale — quantity can't go below that. Delete the return first if you need to reduce it further.`);
+          e.code = 'NEGATIVE_STOCK';
+          throw e;
+        }
+        if (Math.abs(Number(x.rate) - Number(old.rate)) > 0.009) {
+          const e = new Error('This sale has a Sales Return against it — delete the return first, then change the rate (changing it now would leave that return priced at the old rate).');
+          e.code = 'NEGATIVE_STOCK';
+          throw e;
+        }
+      }
       // staged-ness is set once at creation (by whatever setup_mode was at
       // that time) and only ever cleared in bulk by unstageHistoricalEntries
       // — editing a still-staged sale must keep skipping the live checks.
@@ -2025,6 +2072,23 @@ app.patch('/api/purchases/:id', ...editorAccess, async (req, res) => {
           await assertPurchaseLotNotOversold(db, req.clientId, req.params.id, itemChanged ? 0 : Number(x.qty));
         }
       }
+      // Round 20 Bug 2: same gap as editing a sale (see its comment) — a
+      // Purchase Return against this exact batch was never checked, so
+      // shrinking qty below what was returned, or changing the rate, left
+      // the return priced/sized against a batch that no longer matches it.
+      const returnedQty = Number((await db.query('SELECT COALESCE(SUM(qty),0) s FROM purchase_returns WHERE purchase_id=$1', [req.params.id])).rows[0].s);
+      if (returnedQty > 0.001) {
+        if (Number(x.qty) < returnedQty - 0.001) {
+          const e = new Error(`${returnedQty} ${old.unit} has already been returned against this purchase — quantity can't go below that. Delete the return first if you need to reduce it further.`);
+          e.code = 'NEGATIVE_STOCK';
+          throw e;
+        }
+        if (Math.abs(Number(x.rate) - Number(old.rate)) > 0.009) {
+          const e = new Error('This purchase has a Purchase Return against it — delete the return first, then change the rate (changing it now would leave that return priced at the old rate).');
+          e.code = 'NEGATIVE_STOCK';
+          throw e;
+        }
+      }
       const total = Number(x.qty) * Number(x.rate);
       const r = await db.query(
         `UPDATE purchases SET date=$1,supplier=$2,item=$3,qty=$4,unit=$5,rate=$6,total=$7,type=$8,account_id=$9
@@ -2085,8 +2149,16 @@ app.post('/api/purchases/:id/mark-paid', ...editorAccess, async (req, res) => {
         throw e;
       }
       await assertFundsAvailable(db, req.clientId, x.account || 'cash', outstanding);
-      const r = await db.query("UPDATE purchases SET paid=true, account_id=$1, paid_amount=$2 WHERE id=$3 AND client_id=$4 AND type='credit' AND NOT staged RETURNING *",
-        [x.account || 'cash', outstanding, req.params.id, req.clientId]);
+      // Round 20 Bug 7 (root cause): if the frontend's Cover Shortfall flow
+      // auto-created a transfer/loan to make this account able to afford
+      // the outstanding amount, that was real money moving but was never
+      // linked to this purchase before — deleting the purchase later left
+      // the transfer behind as a permanent orphan (same gap fixed for
+      // Mark Cleared below, both traced back to resolveShortfallModal).
+      const newFundingTransferIds = x.fundingTransferIds !== undefined ? fundingIdsJson(x.fundingTransferIds) : purchase.funding_transfer_ids;
+      const newFundingLoanIds = x.fundingLoanIds !== undefined ? fundingIdsJson(x.fundingLoanIds) : purchase.funding_loan_ids;
+      const r = await db.query("UPDATE purchases SET paid=true, account_id=$1, paid_amount=$2, funding_transfer_ids=$3, funding_loan_ids=$4 WHERE id=$5 AND client_id=$6 AND type='credit' AND NOT staged RETURNING *",
+        [x.account || 'cash', outstanding, newFundingTransferIds, newFundingLoanIds, req.params.id, req.clientId]);
       return r.rows[0];
     });
     if (!row) return res.status(404).json({ error: 'Purchase not found, or it is still Historical (turn off Historical Data Entry Mode first)' });
@@ -2106,37 +2178,42 @@ app.delete('/api/purchases/:id', ...editorAccess, async (req, res) => {
       if (!r.rows[0]) return false;
       const old = r.rows[0];
       if (!old.staged) await assertPurchaseLotNotOversold(db, req.clientId, req.params.id, 0);
-      // QA Round 16 — same per-record fix as the sales delete check above:
-      // only block when THIS purchase has actually drawn money from the
-      // supplier's FIFO-pooled payments, not merely because the supplier
-      // has payments recorded somewhere.
-      if (old.type === 'credit' && !old.paid) {
+      // Round 20 Bug 6: Round 19 only improved the MESSAGE for this case —
+      // QA re-tested and found the block itself still fires in the plain
+      // "complete an advance, immediately delete the purchase" case, with
+      // no separate payment anywhere (the "blocking" amount traced back to
+      // pooled leftover from a DIFFERENT advance on the same supplier, not
+      // a real payment the Ledger could point at). Simplest correct rule,
+      // matching QA's own accepted fix: a purchase completed from its own
+      // Supplier Advance always deletes freely — the advance reopens to
+      // "Pending" below regardless, and the FIFO pool doesn't need this
+      // specific row's "outstanding" to be re-validated. A purchase with NO
+      // advance link keeps the normal pooled-payment block unchanged.
+      const linkedAdvance = old.type === 'credit' && !old.paid
+        ? await db.query("SELECT amount FROM purchase_advances WHERE purchase_id=$1 AND client_id=$2 AND status='completed'", [req.params.id, req.clientId])
+        : { rows: [] };
+      if (old.type === 'credit' && !old.paid && !linkedAdvance.rows[0]) {
+        // QA Round 16 — only block when THIS purchase has actually drawn
+        // money from the supplier's FIFO-pooled payments, not merely
+        // because the supplier has payments recorded somewhere.
         const applied = await supplierPurchaseFifoAppliedDb(db, req.clientId, old.supplier, old.id);
         if (applied > 0.009) {
-          // Round 19 Bug 3: a purchase created via Complete Purchase on a
-          // Supplier Advance can still get blocked here — not because of the
-          // advance itself (that part always correctly reopens below), but
-          // because this purchase's remaining balance (after the advance)
-          // drew on a SEPARATE, pooled supplier payment. That was confusing
-          // with the generic message alone ("there is no such payment"),
-          // since the advance is the only thing visibly tied to this
-          // purchase — say so explicitly and point at where the real
-          // blocker actually lives.
-          const linkedAdvance = await db.query("SELECT amount FROM purchase_advances WHERE purchase_id=$1 AND client_id=$2 AND status='completed'", [req.params.id, req.clientId]);
-          const advanceNote = linkedAdvance.rows[0]
-            ? ` This purchase was completed from a Supplier Advance of Rs ${Number(linkedAdvance.rows[0].amount).toFixed(2)} — that part is fine and will return to "Pending" automatically once this delete goes through. The Rs ${applied.toFixed(2)} blocking it is a SEPARATE supplier payment pooled across ${old.supplier}'s other purchases, not the advance — check ${old.supplier}'s Supplier Ledger → Payments History to find and edit/delete that payment first.`
-            : '';
-          const e = new Error(`Rs ${applied.toFixed(2)} has already been paid against this purchase (FIFO-applied from ${old.supplier}'s payments) — delete or edit that payment from the Ledger first, then this purchase.${advanceNote}`);
+          const e = new Error(`Rs ${applied.toFixed(2)} has already been paid against this purchase (FIFO-applied from ${old.supplier}'s payments) — delete or edit that payment from the Ledger first, then this purchase.`);
           e.code = 'HAS_PAYMENTS';
           throw e;
         }
       }
-      await deleteFundingLinks(db, req.clientId, old.funding_transfer_ids, old.funding_loan_ids);
       // a purchase created via Complete Purchase on a Supplier Advance
       // carries that advance's money — deleting it must reopen the advance
       // (not just null the FK) so the money isn't silently lost from view.
       await db.query("UPDATE purchase_advances SET status='open', purchase_id=NULL WHERE purchase_id=$1 AND client_id=$2", [req.params.id, req.clientId]);
       await db.query('DELETE FROM purchases WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+      // the overdraft check inside deleteFundingLinks must run AFTER this
+      // purchase's own row is gone, or it sees this purchase's own spend
+      // still outstanding and wrongly blocks the plain case where nothing
+      // else has touched the money (this delete's own cost is exactly what
+      // frees it back up).
+      await deleteFundingLinks(db, req.clientId, old.funding_transfer_ids, old.funding_loan_ids);
       await recomputeStockItem(db, req.clientId, old.item, old.unit);
       await writeAudit(db, req.clientId, 'purchase', 'delete', {
         entry: { date: old.date, who: old.supplier, item: old.item, qty: old.qty, unit: old.unit, rate: old.rate, total: old.total }
@@ -2146,7 +2223,7 @@ app.delete('/api/purchases/:id', ...editorAccess, async (req, res) => {
     if (!found) return res.status(404).json({ error: 'Purchase not found' });
     res.json({ ok: true });
   } catch (err) {
-    if (err.code === 'NEGATIVE_STOCK' || err.code === 'HAS_PAYMENTS') return res.status(400).json({ error: err.message });
+    if (err.code === 'NEGATIVE_STOCK' || err.code === 'HAS_PAYMENTS' || err.code === 'INSUFFICIENT_FUNDS') return res.status(400).json({ error: err.message });
     console.error('DELETE /api/purchases/:id error:', err);
     res.status(500).json({ error: 'Unable to delete purchase' });
   }
@@ -2305,8 +2382,10 @@ app.delete('/api/purchase-advances/:id', ...editorAccess, async (req, res) => {
       if (!r.rows[0]) return false;
       const old = r.rows[0];
       if (old.status !== 'open') { const e = new Error('This advance has already been completed — delete the linked purchase instead to undo it.'); e.code = 'ALREADY_DONE'; throw e; }
-      await deleteFundingLinks(db, req.clientId, old.funding_transfer_ids, old.funding_loan_ids);
       await db.query('DELETE FROM purchase_advances WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+      // run after the advance's own row is gone — see the matching note on
+      // DELETE /api/purchases/:id.
+      await deleteFundingLinks(db, req.clientId, old.funding_transfer_ids, old.funding_loan_ids);
       await writeAudit(db, req.clientId, 'purchase_advance', 'delete', { entry: { date: old.date, supplier: old.supplier, amount: old.amount, account: old.account_id } });
       return true;
     });
@@ -2314,7 +2393,7 @@ app.delete('/api/purchase-advances/:id', ...editorAccess, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     if (err.code === 'ALREADY_DONE') return res.status(400).json({ error: err.message });
-    if (err.code === 'HAS_PAYMENTS') return res.status(400).json({ error: err.message });
+    if (err.code === 'HAS_PAYMENTS' || err.code === 'INSUFFICIENT_FUNDS') return res.status(400).json({ error: err.message });
     console.error('DELETE /api/purchase-advances/:id error:', err);
     res.status(500).json({ error: 'Unable to delete advance' });
   }
@@ -2408,9 +2487,15 @@ app.post('/api/cheques/:id/clear', ...editorAccess, async (req, res) => {
       if (cheque.direction === 'issued') {
         await assertFundsAvailable(db, req.clientId, account, Number(cheque.amount));
         const paymentId = crypto.randomUUID();
-        await db.query('INSERT INTO supplier_payments (id,client_id,date,supplier,amount,account_id,note) VALUES ($1,$2,$3,$4,$5,$6,$7)', [
+        // Round 20 Bug 7 (root cause): the frontend's Cover Shortfall flow
+        // may have just auto-created a transfer to make `account` able to
+        // afford this — link it to the payment this clear creates, or
+        // deleting this payment (or the cheque itself) later leaves that
+        // transfer behind as a permanent orphan.
+        await db.query('INSERT INTO supplier_payments (id,client_id,date,supplier,amount,account_id,note,funding_transfer_ids,funding_loan_ids) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)', [
           paymentId, req.clientId, today, cheque.party, cheque.amount, account,
-          `Cheque cleared${cheque.bank ? ' (' + cheque.bank + ')' : ''}`
+          `Cheque cleared${cheque.bank ? ' (' + cheque.bank + ')' : ''}`,
+          fundingIdsJson(x.fundingTransferIds), fundingIdsJson(x.fundingLoanIds)
         ]);
         const r = await db.query(
           "UPDATE cheques SET status='cleared', payment_id=$1, account_id=$2 WHERE id=$3 AND client_id=$4 RETURNING *",
@@ -2444,9 +2529,28 @@ app.delete('/api/cheques/:id', ...editorAccess, async (req, res) => {
       const r = await db.query('SELECT * FROM cheques WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       if (!r.rows[0]) return false;
       const old = r.rows[0];
+      // Round 20 Bug 7: clearing a payment cheque with "Cover Shortfall
+      // From" auto-creates a transfer, linked via the supplier_payment's
+      // own funding_transfer_ids — raw-deleting that payment here (instead
+      // of going through deleteFundingLinks, same as DELETE
+      // /api/supplier-payments/:id does) skipped cleaning that transfer up,
+      // leaving its money double-counted forever. Receipts never go
+      // through Cover Shortfall (money arriving needs no shortfall cover),
+      // so they have no funding links to clean up — nothing missing there.
+      // deleteFundingLinks's overdraft check must run AFTER the payment
+      // itself is gone, or it sees this payment's own spend still
+      // outstanding and wrongly blocks the plain case where nothing else
+      // has touched the money since (this delete's own refund is exactly
+      // what frees it back up).
+      let paymentFunding = null;
+      if (old.payment_id) {
+        const paymentRow = await db.query('SELECT funding_transfer_ids, funding_loan_ids FROM supplier_payments WHERE id=$1 AND client_id=$2', [old.payment_id, req.clientId]);
+        if (paymentRow.rows[0]) paymentFunding = paymentRow.rows[0];
+      }
       if (old.receipt_id) await db.query('DELETE FROM receipts WHERE id=$1 AND client_id=$2', [old.receipt_id, req.clientId]);
       if (old.payment_id) await db.query('DELETE FROM supplier_payments WHERE id=$1 AND client_id=$2', [old.payment_id, req.clientId]);
       await db.query('DELETE FROM cheques WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+      if (paymentFunding) await deleteFundingLinks(db, req.clientId, paymentFunding.funding_transfer_ids, paymentFunding.funding_loan_ids);
       await writeAudit(db, req.clientId, 'cheque', 'delete', {
         entry: { date: old.date, party: old.party, bank: old.bank, amount: old.amount, dueDate: old.due_date, status: old.status }
       });
@@ -2455,6 +2559,7 @@ app.delete('/api/cheques/:id', ...editorAccess, async (req, res) => {
     if (!found) return res.status(404).json({ error: 'Cheque not found' });
     res.json({ ok: true });
   } catch (err) {
+    if (err.code === 'HAS_PAYMENTS' || err.code === 'INSUFFICIENT_FUNDS') return res.status(400).json({ error: err.message });
     console.error('DELETE /api/cheques/:id error:', err);
     res.status(500).json({ error: 'Unable to delete cheque' });
   }
@@ -2551,12 +2656,17 @@ app.post('/api/partners', ...editorAccess, async (req, res) => {
     return res.status(400).json({ error: 'Opening Commission must be zero or greater' });
   }
   try {
-    const row = await withTenantDb(req.clientId, (db) =>
-      db.query('INSERT INTO partners (id,client_id,name,opening_profit) VALUES ($1,$2,$3,$4) RETURNING *',
-        [crypto.randomUUID(), req.clientId, x.name, Number(x.openingProfit) || 0]).then((r) => r.rows[0])
-    );
+    const row = await withTenantDb(req.clientId, async (db) => {
+      // Round 20 Bug 4: two agents with the same name could both be
+      // created — Pay Commission Agent then can't tell them apart.
+      const dup = await db.query('SELECT 1 FROM partners WHERE client_id=$1 AND LOWER(TRIM(name))=LOWER(TRIM($2))', [req.clientId, x.name]);
+      if (dup.rows[0]) { const e = new Error('A commission agent with this name already exists'); e.code = 'DUPLICATE_NAME'; throw e; }
+      return db.query('INSERT INTO partners (id,client_id,name,opening_profit) VALUES ($1,$2,$3,$4) RETURNING *',
+        [crypto.randomUUID(), req.clientId, x.name, Number(x.openingProfit) || 0]).then((r) => r.rows[0]);
+    });
     res.json(mapPartner(row));
   } catch (err) {
+    if (err.code === 'DUPLICATE_NAME' || err.code === '23505') return res.status(409).json({ error: 'A commission agent with this name already exists' });
     console.error('POST /api/partners error:', err);
     res.status(500).json({ error: 'Unable to add partner' });
   }
@@ -2584,13 +2694,24 @@ app.delete('/api/partners/:id', ...editorAccess, async (req, res) => {
 app.post('/api/banks', ...editorAccess, async (req, res) => {
   const x = req.body || {};
   if (!x.name) return res.status(400).json({ error: 'Name required' });
+  // Round 20 Bug 3: Opening Balance accepted a negative number and silently
+  // lowered Total Funds — the same class of bug Materials/Commission Agents
+  // already guard against, just missed here.
+  if (x.openingBalance !== undefined && x.openingBalance !== null && x.openingBalance !== '' && !isNonNegativeAmount(x.openingBalance)) {
+    return res.status(400).json({ error: 'Opening Balance must be zero or greater' });
+  }
   try {
-    const row = await withTenantDb(req.clientId, (db) =>
-      db.query('INSERT INTO bank_accounts (id,client_id,name,opening_balance,is_locker) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-        [crypto.randomUUID(), req.clientId, x.name, Number(x.openingBalance) || 0, !!x.locker]).then((r) => r.rows[0])
-    );
+    const row = await withTenantDb(req.clientId, async (db) => {
+      // Round 20 Bug 4: two bank accounts with the same name could both be
+      // created, making them impossible to tell apart in every dropdown.
+      const dup = await db.query('SELECT 1 FROM bank_accounts WHERE client_id=$1 AND LOWER(TRIM(name))=LOWER(TRIM($2))', [req.clientId, x.name]);
+      if (dup.rows[0]) { const e = new Error('A bank account with this name already exists'); e.code = 'DUPLICATE_NAME'; throw e; }
+      return db.query('INSERT INTO bank_accounts (id,client_id,name,opening_balance,is_locker) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+        [crypto.randomUUID(), req.clientId, x.name, Number(x.openingBalance) || 0, !!x.locker]).then((r) => r.rows[0]);
+    });
     res.json(mapBank(row));
   } catch (err) {
+    if (err.code === 'DUPLICATE_NAME' || err.code === '23505') return res.status(409).json({ error: 'A bank account with this name already exists' });
     console.error('POST /api/banks error:', err);
     res.status(500).json({ error: 'Unable to add bank' });
   }
@@ -2598,11 +2719,16 @@ app.post('/api/banks', ...editorAccess, async (req, res) => {
 
 app.patch('/api/banks/:id', ...editorAccess, async (req, res) => {
   const x = req.body || {};
+  if (x.openingBalance !== undefined && x.openingBalance !== null && x.openingBalance !== '' && !isNonNegativeAmount(x.openingBalance)) {
+    return res.status(400).json({ error: 'Opening Balance must be zero or greater' });
+  }
   try {
     const row = await withTenantDb(req.clientId, async (db) => {
       const before = await db.query('SELECT * FROM bank_accounts WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       if (!before.rows[0]) return null;
       const old = before.rows[0];
+      const dup = await db.query('SELECT 1 FROM bank_accounts WHERE client_id=$1 AND id<>$2 AND LOWER(TRIM(name))=LOWER(TRIM($3))', [req.clientId, req.params.id, x.name]);
+      if (dup.rows[0]) { const e = new Error('A bank account with this name already exists'); e.code = 'DUPLICATE_NAME'; throw e; }
       const r = await db.query('UPDATE bank_accounts SET name=$1, opening_balance=$2, is_locker=$3 WHERE id=$4 AND client_id=$5 RETURNING *',
         [x.name, Number(x.openingBalance) || 0, !!x.locker, req.params.id, req.clientId]);
       await writeAudit(db, req.clientId, 'bank', 'edit', {
@@ -2614,6 +2740,7 @@ app.patch('/api/banks/:id', ...editorAccess, async (req, res) => {
     if (!row) return res.status(404).json({ error: 'Bank not found' });
     res.json(mapBank(row));
   } catch (err) {
+    if (err.code === 'DUPLICATE_NAME' || err.code === '23505') return res.status(409).json({ error: 'A bank account with this name already exists' });
     console.error('PATCH /api/banks/:id error:', err);
     res.status(500).json({ error: 'Unable to update bank' });
   }
@@ -2642,6 +2769,9 @@ app.post('/api/parties', ...editorAccess, async (req, res) => {
   const x = req.body || {};
   const name = (x.name || '').trim();
   if (!name) return res.status(400).json({ error: 'Name required' });
+  if (x.openingBalance !== undefined && x.openingBalance !== null && x.openingBalance !== '' && !isNonNegativeAmount(x.openingBalance)) {
+    return res.status(400).json({ error: 'Opening Balance must be zero or greater' });
+  }
   try {
     const row = await withTenantDb(req.clientId, (db) =>
       db.query('INSERT INTO parties (id,client_id,name,opening_balance,due_date) VALUES ($1,$2,$3,$4,$5) RETURNING *',
@@ -2657,6 +2787,9 @@ app.post('/api/parties', ...editorAccess, async (req, res) => {
 
 app.patch('/api/parties/:id', ...editorAccess, async (req, res) => {
   const x = req.body || {};
+  if (x.openingBalance !== undefined && x.openingBalance !== null && x.openingBalance !== '' && !isNonNegativeAmount(x.openingBalance)) {
+    return res.status(400).json({ error: 'Opening Balance must be zero or greater' });
+  }
   try {
     const row = await withTenantDb(req.clientId, async (db) => {
       const before = await db.query('SELECT * FROM parties WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
@@ -2702,6 +2835,9 @@ app.post('/api/suppliers', ...editorAccess, async (req, res) => {
   const x = req.body || {};
   const name = (x.name || '').trim();
   if (!name) return res.status(400).json({ error: 'Name required' });
+  if (x.openingBalance !== undefined && x.openingBalance !== null && x.openingBalance !== '' && !isNonNegativeAmount(x.openingBalance)) {
+    return res.status(400).json({ error: 'Opening Balance must be zero or greater' });
+  }
   try {
     const row = await withTenantDb(req.clientId, (db) =>
       db.query('INSERT INTO suppliers (id,client_id,name,opening_balance,due_date) VALUES ($1,$2,$3,$4,$5) RETURNING *',
@@ -2717,6 +2853,9 @@ app.post('/api/suppliers', ...editorAccess, async (req, res) => {
 
 app.patch('/api/suppliers/:id', ...editorAccess, async (req, res) => {
   const x = req.body || {};
+  if (x.openingBalance !== undefined && x.openingBalance !== null && x.openingBalance !== '' && !isNonNegativeAmount(x.openingBalance)) {
+    return res.status(400).json({ error: 'Opening Balance must be zero or greater' });
+  }
   try {
     const row = await withTenantDb(req.clientId, async (db) => {
       const before = await db.query('SELECT * FROM suppliers WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
@@ -2895,15 +3034,17 @@ app.delete('/api/expenses/:id', ...editorAccess, async (req, res) => {
       const r = await db.query('SELECT * FROM expenses WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       if (!r.rows[0]) return false;
       const old = r.rows[0];
-      await deleteFundingLinks(db, req.clientId, old.funding_transfer_ids, old.funding_loan_ids);
       await db.query('DELETE FROM expenses WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+      // run after the expense's own row is gone — see the matching note on
+      // DELETE /api/purchases/:id.
+      await deleteFundingLinks(db, req.clientId, old.funding_transfer_ids, old.funding_loan_ids);
       await writeAudit(db, req.clientId, 'expense', 'delete', { entry: { date: old.date, desc: old.description, amount: old.amount, account: old.account_id } });
       return true;
     });
     if (!found) return res.status(404).json({ error: 'Expense not found' });
     res.json({ ok: true });
   } catch (err) {
-    if (err.code === 'HAS_PAYMENTS') return res.status(400).json({ error: err.message });
+    if (err.code === 'HAS_PAYMENTS' || err.code === 'INSUFFICIENT_FUNDS') return res.status(400).json({ error: err.message });
     console.error('DELETE /api/expenses/:id error:', err);
     res.status(500).json({ error: 'Unable to delete expense' });
   }
@@ -2918,6 +3059,20 @@ app.post('/api/misc-income', ...editorAccess, async (req, res) => {
   if (x.mode === 'supplier' && !x.supplier) return res.status(400).json({ error: 'Choose which supplier to credit' });
   try {
     const row = await withTenantDb(req.clientId, async (db) => {
+      // Round 20 Bug 5: the Supplier box was free text — a made-up name got
+      // accepted, counted as real income in Trade Summary/Net Worth, but
+      // credited no supplier's payable at all (the money effectively came
+      // from nowhere). A supplier only "exists" the same way the Supplier
+      // Ledger's own dropdown already decides it does: a row in the
+      // suppliers master table, OR a name already used on a real purchase.
+      if (x.mode === 'supplier') {
+        const known = await db.query(
+          `SELECT 1 FROM suppliers WHERE client_id=$1 AND LOWER(TRIM(name))=LOWER(TRIM($2))
+           UNION SELECT 1 FROM purchases WHERE client_id=$1 AND LOWER(TRIM(supplier))=LOWER(TRIM($2))`,
+          [req.clientId, x.supplier]
+        );
+        if (!known.rows[0]) { const e = new Error(`"${x.supplier}" is not a known supplier — pick one that already has a purchase or a Master Record entry.`); e.code = 'UNKNOWN_SUPPLIER'; throw e; }
+      }
       const account = x.mode === 'cash' ? (x.account || 'cash') : null;
       const r = await db.query(
         'INSERT INTO misc_income (id, client_id, date, description, amount, mode, account_id, supplier, note, exclude_from_profit) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *',
@@ -2927,6 +3082,7 @@ app.post('/api/misc-income', ...editorAccess, async (req, res) => {
     });
     res.json(mapMiscIncome(row));
   } catch (err) {
+    if (err.code === 'UNKNOWN_SUPPLIER') return res.status(400).json({ error: err.message });
     console.error('POST /api/misc-income error:', err);
     res.status(500).json({ error: 'Unable to add misc income' });
   }
@@ -3115,15 +3271,17 @@ app.delete('/api/payouts/:id', ...editorAccess, async (req, res) => {
       const r = await db.query('SELECT * FROM payouts WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       if (!r.rows[0]) return false;
       const old = r.rows[0];
-      await deleteFundingLinks(db, req.clientId, old.funding_transfer_ids, old.funding_loan_ids);
       await db.query('DELETE FROM payouts WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+      // run after the payout's own row is gone — see the matching note on
+      // DELETE /api/purchases/:id.
+      await deleteFundingLinks(db, req.clientId, old.funding_transfer_ids, old.funding_loan_ids);
       await writeAudit(db, req.clientId, 'payout', 'delete', { entry: { date: old.date, recipientType: old.recipient_type, amount: old.amount, account: old.account_id, note: old.note } });
       return true;
     });
     if (!found) return res.status(404).json({ error: 'Payout not found' });
     res.json({ ok: true });
   } catch (err) {
-    if (err.code === 'HAS_PAYMENTS') return res.status(400).json({ error: err.message });
+    if (err.code === 'HAS_PAYMENTS' || err.code === 'INSUFFICIENT_FUNDS') return res.status(400).json({ error: err.message });
     console.error('DELETE /api/payouts/:id error:', err);
     res.status(500).json({ error: 'Unable to delete payout' });
   }
@@ -3202,8 +3360,10 @@ app.delete('/api/supplier-payments/:id', ...editorAccess, async (req, res) => {
       const r = await db.query('SELECT * FROM supplier_payments WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       if (!r.rows[0]) return false;
       const old = r.rows[0];
-      await deleteFundingLinks(db, req.clientId, old.funding_transfer_ids, old.funding_loan_ids);
       await db.query('DELETE FROM supplier_payments WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+      // run after the payment's own row is gone — see the matching note on
+      // DELETE /api/purchases/:id.
+      await deleteFundingLinks(db, req.clientId, old.funding_transfer_ids, old.funding_loan_ids);
       // QA Round 14, Bug 6 — same as receipts: put the cheque back to
       // Pending if this payment was the one created by clearing it.
       await db.query("UPDATE cheques SET status='pending', payment_id=NULL WHERE client_id=$1 AND payment_id=$2", [req.clientId, req.params.id]);
@@ -3213,7 +3373,7 @@ app.delete('/api/supplier-payments/:id', ...editorAccess, async (req, res) => {
     if (!found) return res.status(404).json({ error: 'Supplier payment not found' });
     res.json({ ok: true });
   } catch (err) {
-    if (err.code === 'HAS_PAYMENTS') return res.status(400).json({ error: err.message });
+    if (err.code === 'HAS_PAYMENTS' || err.code === 'INSUFFICIENT_FUNDS') return res.status(400).json({ error: err.message });
     console.error('DELETE /api/supplier-payments/:id error:', err);
     res.status(500).json({ error: 'Unable to delete supplier payment' });
   }
@@ -3255,16 +3415,23 @@ app.delete('/api/transfers/:id', ...editorAccess, async (req, res) => {
       // Cash at Rs -125,400 with no warning (the 2026-10-22 incident).
       const toBalance = await computeAccountBalanceDb(db, req.clientId, old.to_account);
       if (Number(old.amount) > toBalance + 0.009) {
-        const shortBy = (Number(old.amount) - toBalance).toFixed(2);
-        const resultingBalance = (toBalance - Number(old.amount)).toFixed(2);
+        // Round 20 Item 11(d): .toFixed(2) on the resulting (negative)
+        // balance printed "Rs -300.00" — every other money figure in this
+        // app is comma-grouped with no decimals (fmtMoneyServer).
+        const shortBy = fmtMoneyServer(Number(old.amount) - toBalance);
+        const resultingBalance = fmtMoneyServer(toBalance - Number(old.amount));
         const toName = old.to_account === 'cash' ? 'Cash'
           : (await db.query('SELECT name FROM bank_accounts WHERE id=$1 AND client_id=$2', [old.to_account, req.clientId])).rows[0]?.name || 'That account';
         const e = new Error(`Deleting this transfer would take ${toName} to Rs ${resultingBalance} (short by Rs ${shortBy}) — its money has already been spent elsewhere. Delete or edit whatever used it first${old.note === 'Auto-transfer to cover a shortfall' ? ' (likely the purchase or entry this shortfall-cover transfer was created for)' : ''}, then this transfer.`);
         e.code = 'INSUFFICIENT_FUNDS';
         throw e;
       }
-      await deleteFundingLinks(db, req.clientId, old.funding_transfer_ids, old.funding_loan_ids);
       await db.query('DELETE FROM transfers WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+      // run after this transfer's own row is gone — see the matching note
+      // on DELETE /api/purchases/:id (this transfer's own debit from
+      // from_account is reversed by the delete above, which is exactly what
+      // its OWN funding transfers' overdraft check needs to see first).
+      await deleteFundingLinks(db, req.clientId, old.funding_transfer_ids, old.funding_loan_ids);
       await writeAudit(db, req.clientId, 'transfer', 'delete', { entry: { date: old.date, amount: old.amount, fromAccount: old.from_account, toAccount: old.to_account, note: old.note } });
       return true;
     });
@@ -3316,7 +3483,7 @@ app.delete('/api/personal-loans/:id', ...editorAccess, async (req, res) => {
       const balanceAfterDelete = balanceIncludingThisLoan - Number(old.amount);
       if (balanceAfterDelete < -0.009) {
         const accName = accId === 'cash' ? 'Cash' : (await db.query('SELECT name FROM bank_accounts WHERE id=$1 AND client_id=$2', [accId, req.clientId])).rows[0]?.name || 'That account';
-        const e = new Error(`Deleting this loan would take ${accName} to Rs ${balanceAfterDelete.toFixed(2)} (short by Rs ${Math.abs(balanceAfterDelete).toFixed(2)}) — its money has already been spent elsewhere. Delete or edit whatever used it first, then this loan.`);
+        const e = new Error(`Deleting this loan would take ${accName} to Rs ${fmtMoneyServer(balanceAfterDelete)} (short by Rs ${fmtMoneyServer(Math.abs(balanceAfterDelete))}) — its money has already been spent elsewhere. Delete or edit whatever used it first, then this loan.`);
         e.code = 'INSUFFICIENT_FUNDS';
         throw e;
       }

@@ -1600,8 +1600,16 @@ async function resolveShortfallMulti({date, account, total, getAvailable, prefix
 // Same cover-shortfall UI/logic as the full forms, packaged as a one-off
 // modal for actions that don't have a persistent form of their own — Mark
 // Paid (a credit purchase) and Mark Cleared (an issued cheque). Resolves
-// true once funds are actually secured and the caller may proceed, false if
-// cancelled — callers should not perform their action on a false result.
+// {transferIds, loanIds} (both possibly empty) once funds are actually
+// secured and the caller may proceed, null if cancelled — callers should
+// not perform their action on a null result.
+// Round 20 Bug 7: this used to resolve a bare `true`/`false`, discarding
+// resolveShortfallMulti's own {transferIds, loanIds} result entirely — any
+// transfer it auto-created to cover the shortfall was real (money actually
+// moved) but never linked to whatever Mark Paid/Mark Cleared went on to
+// create, so deleting that purchase/payment later left the transfer
+// behind as a permanent, invisible orphan (same root cause as Round 19
+// Bug 5, just never wired through here).
 function resolveShortfallModal({date, account, total, getAvailable}){
   return new Promise((resolve)=>{
     const root = document.getElementById('modalRoot');
@@ -1617,21 +1625,22 @@ function resolveShortfallModal({date, account, total, getAvailable}){
       <div class="modal-actions"><button class="btn danger" id="sfm_cancel">Cancel</button><button class="btn gold" id="sfm_confirm">Confirm</button></div>
     </div></div>`;
     const close = (v)=>{ root.innerHTML=''; resolve(v); };
-    root.querySelector('#sfm_cancel').onclick = ()=>close(false);
-    root.querySelector('.modal-overlay').onclick = (e)=>{ if(e.target.classList.contains('modal-overlay')) close(false); };
+    root.querySelector('#sfm_cancel').onclick = ()=>close(null);
+    root.querySelector('.modal-overlay').onclick = (e)=>{ if(e.target.classList.contains('modal-overlay')) close(null); };
     wireShortfallCover(root, 'sfm', ()=>account, ()=>total, getAvailable);
     enableEnterNav(root, '#sfm_confirm');
     root.querySelector('#sfm_confirm').onclick = async ()=>{
-      const ok = await resolveShortfallMulti({ date, account, total, getAvailable, prefix:'sfm', main: root });
-      if(ok) close(true);
+      const funding = await resolveShortfallMulti({ date, account, total, getAvailable, prefix:'sfm', main: root });
+      if(funding) close(funding);
     };
   });
 }
-// Shared entry point: if the account already has enough, resolves true
-// immediately with no UI. Otherwise opens resolveShortfallModal and waits
-// for the user to actually secure the difference (or cancel).
+// Shared entry point: if the account already has enough, resolves
+// {transferIds:[], loanIds:[]} immediately with no UI. Otherwise opens
+// resolveShortfallModal and waits for the user to actually secure the
+// difference (or cancel, which resolves null).
 async function ensureFundsAvailable({date, account, total, getAvailable}){
-  if(total <= getAvailable(account)) return true;
+  if(total <= getAvailable(account)) return {transferIds:[], loanIds:[]};
   return await resolveShortfallModal({date, account, total, getAvailable});
 }
 function cashInHand(){ return accountBalance('cash'); }
@@ -2010,6 +2019,7 @@ function investorExpenseShare(investor, period){
   const share = totalInv ? (Number(investor.amount)||0) / totalInv : 0; // expenses are split the same way as profit — by % of total investment
   let total = 0;
   state.expenses.forEach(e=>{
+    if(e.excludeFromProfit) return; // Round 20 Item 8: a one-time balance adjustment is excluded from Trade Summary/Gross Profit/Net Worth Growth — must stay excluded here too, or an investor's expense share disagrees with those reports over the exact same entry.
     if(!periodMatches(e.date, period)) return;
     total += Number(e.amount) * share;
   });
@@ -3107,7 +3117,7 @@ function wireMaterialSection(main){
       const s = state.stock.find(x=>x.id===b.dataset.delmaterial);
       const hasStock = s && Number(s.qty)!==0;
       const msg = hasStock
-        ? `This material still has ${fmtQty(s.qty)} ${s.unit} in stock — remove it anyway? Its purchase/sale history is not affected, but it will need to be re-added if used again.`
+        ? `This material still has ${fmtQtyPlain(s.qty)} ${s.unit} in stock — remove it anyway? Its purchase/sale history is not affected, but it will need to be re-added if used again.`
         : 'Remove this material? This cannot be undone (its purchase/sale history is not affected).';
       if(!await showConfirm(msg)) return;
       try{
@@ -3155,6 +3165,7 @@ function wireSupplierSection(main){
     const openingBalance = Number(main.querySelector('#su_balance').value)||0;
     const dueDate = main.querySelector('#su_due').value || null;
     if(!name){ await showAlert('Enter a supplier name'); return; }
+    if(!isNonNegativeAmount(openingBalance)){ await showAlert('Opening Balance must be zero or greater'); return; }
     try{
       if(editingSupplier){
         await api('PATCH','/api/suppliers/'+editingSupplier.id, {name, openingBalance, dueDate});
@@ -3220,6 +3231,7 @@ function wireBuyerSection(main){
     const openingBalance = Number(main.querySelector('#by_balance').value)||0;
     const dueDate = main.querySelector('#by_due').value || null;
     if(!name){ await showAlert('Enter a buyer name'); return; }
+    if(!isNonNegativeAmount(openingBalance)){ await showAlert('Opening Balance must be zero or greater'); return; }
     try{
       if(editingParty){
         await api('PATCH','/api/parties/'+editingParty.id, {name, openingBalance, dueDate});
@@ -3779,7 +3791,7 @@ function renderBuyerLedger(main, ro){
         <thead><tr><th>Date</th><th>Item</th><th>Qty</th><th>Total</th><th>Received</th><th>Outstanding</th><th>Status</th><th>Due Date</th></tr></thead>
         <tbody>
           ${rows.map(r=>`
-            <tr><td>${fmtDate(r.sale.date)}</td><td>${r.sale.item}</td><td>${fmtQty(r.sale.qty)} ${r.sale.unit||'kg'}</td><td>Rs ${fmt(r.sale.total)}</td><td>Rs ${fmt(r.received)}</td><td>Rs ${fmt(Number(r.sale.total)-r.received)}</td>
+            <tr><td>${fmtDate(r.sale.date)}</td><td>${r.sale.item}</td><td>${fmtQty(r.sale.qty)} ${r.sale.unit||'kg'}</td><td>Rs ${fmt(r.sale.total)}</td><td>Rs ${fmt(r.received)}</td><td>Rs ${fmt(r.effectiveTotal-r.received)}</td>
             <td>${r.status==='clear'?'<span class="pill ok">Clear</span>':r.status==='partial'?'<span class="pill partial">Partially Received</span>':(r.sale.type==='cash'?'<span class="pill cash">Cash</span>':'<span class="pill credit">Pending</span>')}</td>
             <td>${r.sale.type==='credit'?fmtDate(r.sale.dueDate):'—'}</td></tr>`).join('') || `<tr><td colspan="8" class="empty">No sales for this party</td></tr>`}
         </tbody>
@@ -3912,8 +3924,20 @@ function renderSupplierLedger(main, ro){
     const appliedToPurchase = Math.min(Number(a.amount), purchaseNet);
     return {kind:'advance', date:a.date, amount:appliedToPurchase, account:a.account, purchase:p};
   });
+  // Round 20 Item 9: an advance bigger than its own purchase (supplierAdvanceExcessTotal)
+  // feeds straight into the same pool Total Paid/Pending draw from, but had
+  // no Payments History row at all — the tiles counted this money while the
+  // table below looked like it was missing. Add one row per advance with
+  // leftover, same style as the direct-advance row above.
+  const advanceExcessRows = state.purchaseAdvances.filter(a=>a.status==='completed' && a.supplier===ledgerSupplier).map(a=>{
+    const p = state.purchases.find(x=>x.id===a.purchaseId);
+    const purchaseNet = p ? Math.max(0, Number(p.total) - purchaseReturnsTotal(p.id)) : Number(a.amount);
+    const excess = Math.max(0, Number(a.amount) - purchaseNet);
+    return {kind:'advance-excess', date:a.date, amount:excess, account:a.account, purchase:p};
+  }).filter(r=>r.amount>0.009);
   const supplierPaymentsList = state.supplierPayments.filter(p=>p.supplier===ledgerSupplier).map(p=>({kind:'payment', date:p.date, payment:p}))
     .concat(advancePaymentRows)
+    .concat(advanceExcessRows)
     .sort((a,b)=> a.date<b.date?1:a.date>b.date?-1:0);
   main.innerHTML = `
     <section class="block">
@@ -3986,6 +4010,11 @@ function renderSupplierLedger(main, ro){
               const a = row;
               const purchaseNote = a.purchase ? `Advance applied — against purchase of ${fmtDate(a.purchase.date)} (${a.purchase.item})` : 'Advance applied';
               return `<tr><td>${fmtDate(a.date)}</td><td>Rs ${fmt(a.amount)}</td><td>${((allAccounts().find(x=>x.id===(a.account||'cash'))||{}).name||'Cash')}</td><td><span class="pill role" title="Money left the bank when the Supplier Advance was issued — this is how much of it this purchase actually used">${purchaseNote}</span></td>${ro?'':'<td></td>'}</tr>`;
+            }
+            if(row.kind==='advance-excess'){
+              const a = row;
+              const purchaseNote = a.purchase ? `Advance leftover — more than ${fmtDate(a.purchase.date)}'s purchase (${a.purchase.item}) needed, pooled toward this supplier's other dues` : 'Advance leftover — pooled toward this supplier\'s other dues';
+              return `<tr><td>${fmtDate(a.date)}</td><td>Rs ${fmt(a.amount)}</td><td>${((allAccounts().find(x=>x.id===(a.account||'cash'))||{}).name||'Cash')}</td><td><span class="pill role" title="The Supplier Advance was bigger than what its own purchase cost — the rest counts toward Total Paid/Pending here just like a real payment would">${purchaseNote}</span></td>${ro?'':'<td></td>'}</tr>`;
             }
             const p = row.payment;
             return `<tr><td>${fmtDate(p.date)}</td><td>Rs ${fmt(p.amount)}</td><td>${p.staged ? '<span class="pill role" title="Entered during Historical Data Entry Mode — reduces the payable immediately, but permanently excluded from Cash/Bank">Historical</span>' : ((allAccounts().find(a=>a.id===(p.account||'cash'))||{}).name||'Cash')}</td><td>${p.note||'—'}</td>
@@ -4256,9 +4285,12 @@ function renderPurchases(main){
       const account = sel ? sel.value : 'cash';
       const purchase = state.purchases.find(p=>p.id===b.dataset.ppaid);
       const outstanding = purchase ? creditPurchaseOutstanding(purchase) : 0;
-      const ok = await ensureFundsAvailable({ date: todayStr(), account, total: outstanding, getAvailable: accountBalance });
-      if(!ok) return;
-      try { await api('POST', '/api/purchases/'+b.dataset.ppaid+'/mark-paid', {account}); await refreshState(); showToast('Marked as paid'); }
+      const funding = await ensureFundsAvailable({ date: todayStr(), account, total: outstanding, getAvailable: accountBalance });
+      if(!funding) return;
+      try {
+        await api('POST', '/api/purchases/'+b.dataset.ppaid+'/mark-paid', {account, fundingTransferIds: funding.transferIds, fundingLoanIds: funding.loanIds});
+        await refreshState(); showToast('Marked as paid');
+      }
       catch(e){ await showAlert(e.message); }
     };
   });
@@ -4597,9 +4629,11 @@ function wirePaymentSection(main){
       // only an issued (paid-to-supplier) cheque draws money out on
       // clearing — a received cheque is an inflow, nothing to check.
       const cheque = state.cheques.find(c=>c.id===b.dataset.clear);
+      let clearFunding = {transferIds:[], loanIds:[]};
       if(cheque && cheque.direction==='issued' && account){
-        const ok = await ensureFundsAvailable({ date: todayStr(), account, total: Number(cheque.amount), getAvailable: accountBalance });
-        if(!ok) return;
+        const funding = await ensureFundsAvailable({ date: todayStr(), account, total: Number(cheque.amount), getAvailable: accountBalance });
+        if(!funding) return;
+        clearFunding = funding;
       }
       // QA Round 14, Bugs 1/2/3 also apply to clearing a cheque (it posts
       // a receipt/payment the same as the Payment tab does) — same
@@ -4614,7 +4648,10 @@ function wirePaymentSection(main){
           if(!await showConfirm(`This cheque is Rs ${fmtPlain(amt)}, more than ${cheque.party}'s pending balance of Rs ${fmtPlain(pending)}. The extra Rs ${fmtPlain(amt-pending)} will be recorded as ${advanceNote}. Clear it?`)) return;
         }
       }
-      try { await api('POST', '/api/cheques/'+b.dataset.clear+'/clear', {account}); await refreshState(); showToast('Cheque marked cleared'); }
+      try {
+        await api('POST', '/api/cheques/'+b.dataset.clear+'/clear', {account, fundingTransferIds: clearFunding.transferIds, fundingLoanIds: clearFunding.loanIds});
+        await refreshState(); showToast('Cheque marked cleared');
+      }
       catch(e){ await showAlert(e.message); }
     };
   });
@@ -4984,8 +5021,15 @@ function renderInvestors(main){
     const inv = state.investors.find(i=>i.id===recipientId);
     if(inv){
       const owed = Number(inv.amount) + investorProfitShare(inv,'all') - investorExpenseShare(inv,'all') - payoutsTotal('investor', inv.id);
-      if(amount > owed){
-        if(!await showConfirm(`This investor is only owed Rs ${fmtPlain(owed)}, but you're paying Rs ${fmtPlain(amount)} — Rs ${fmtPlain(amount-owed)} more than owed. Continue anyway?`)) return;
+      // Round 20 Item 10: same hard-block policy as the Commission Agent and
+      // Personal Loan overpayment checks (Round 19 Bug 6) — a bare "Continue
+      // anyway?" let an investor be paid more than they were actually owed,
+      // with no record of the overage anywhere (unlike a Buyer/Supplier
+      // overpayment, which becomes a tracked Advance against their next
+      // bill — an investor has no equivalent "next" to carry it into).
+      if(amount > owed + 0.009){
+        await showAlert(`This investor is only owed Rs ${fmtPlain(owed)} — Rs ${fmtPlain(amount)} would overpay them by Rs ${fmtPlain(amount-owed)}. Reduce the amount, or wait until more profit is earned.`);
+        return;
       }
     }
     const funding = await resolveShortfallMulti({ date, account, total: amount, getAvailable: accountBalance, prefix:'ip', main });
@@ -5023,6 +5067,15 @@ function renderInvestors(main){
 }
 
 function commissionLedgerHtml(){
+  // Round 20 Bug 1: this combined ledger (commission earned + payments, one
+  // running balance) had no Edit/Delete at all on its payment rows — the
+  // ONLY place a commission payment could be fixed was the separate "Pay
+  // Commission Agent" section's own history table below. Reusing the exact
+  // same data-editpayout/data-delpayout attributes means the wiring already
+  // set up for that other table (in renderPartners) picks these up too, with
+  // no new wiring needed — both tables' buttons run through the same
+  // validated editPayoutModal / DELETE /api/payouts/:id path.
+  const ro = !canEditActiveClient();
   if(!ledgerPartnerId || !state.partners.find(p=>p.id===ledgerPartnerId)) ledgerPartnerId = state.partners[0].id;
   const partner = state.partners.find(p=>p.id===ledgerPartnerId);
   const rows = partnerLedgerRows(partner);
@@ -5046,14 +5099,15 @@ function commissionLedgerHtml(){
       <h2>${partner.name} — Transactions</h2>
       <div style="overflow-x:auto;">
       <table>
-        <thead><tr><th>Date</th><th>Type</th><th>Party / Item</th><th>Amount</th><th>Balance</th></tr></thead>
+        <thead><tr><th>Date</th><th>Type</th><th>Party / Item</th><th>Amount</th><th>Balance</th>${ro?'':'<th></th>'}</tr></thead>
         <tbody>
-          <tr><td>—</td><td>Opening</td><td>—</td><td>—</td><td>Rs ${fmt(partner.openingProfit||0)}</td></tr>
+          <tr><td>—</td><td>Opening</td><td>—</td><td>—</td><td>Rs ${fmt(partner.openingProfit||0)}</td>${ro?'':'<td></td>'}</tr>
           ${rows.map(r=>`
             <tr><td>${fmtDate(r.date)}</td><td>${r.kind==='payout'?'<span class="pill credit">Payment</span>':'<span class="pill ok">Commission</span>'}</td>
             <td>${r.kind==='payout'?(r.payout.note||'—'):(r.party+' — '+r.item)}</td>
             <td style="color:${r.amount<0?'var(--danger,#c0392b)':'inherit'};">${r.amount<0?'-':'+'}Rs ${fmt(Math.abs(r.amount))}</td>
-            <td>Rs ${fmt(r.balance)}</td></tr>`).join('') || `<tr><td colspan="5" class="empty">No commission or payments recorded yet</td></tr>`}
+            <td>Rs ${fmt(r.balance)}</td>
+            ${ro?'':`<td class="row-actions">${r.kind==='payout'?`<button class="btn danger" data-editpayout="${r.payout.id}">Edit</button><button class="btn danger" data-delpayout="${r.payout.id}">Delete</button>`:''}</td>`}</tr>`).join('') || `<tr><td colspan="${ro?5:6}" class="empty">No commission or payments recorded yet</td></tr>`}
         </tbody>
       </table>
       </div>
@@ -5135,8 +5189,19 @@ function renderPartners(main){
   enableEnterNav(main.querySelector('#pt_name').closest('section'), '#pt_add');
   main.querySelectorAll('[data-delpartner]').forEach(b=>{
     b.onclick = async()=>{
-      if(!await showConfirm('Delete this commission agent? This cannot be undone.')) return;
+      // Round 20 Bug 1: deleting an agent used to leave their payments
+      // behind as orphans — the money was never actually returned, so the
+      // account it left from stayed short and Books Balance Check showed a
+      // permanent "unexplained gap" equal to the payment. Same fix as
+      // Round 19 Bug 8 for Investors/Personal Loans: make the cascade
+      // explicit in one confirm. Decline it and nothing is deleted.
+      const linkedPayouts = state.payouts.filter(p=>p.recipientType==='partner' && p.recipientId===b.dataset.delpartner);
+      const msg = linkedPayouts.length
+        ? `Delete this commission agent? This also permanently deletes their ${linkedPayouts.length} payment record${linkedPayouts.length>1?'s':''} (Rs ${fmtPlain(linkedPayouts.reduce((a,p)=>a+Number(p.amount),0))} total) — otherwise that money would never be returned to the account it was paid from. This cannot be undone.`
+        : 'Delete this commission agent? This cannot be undone.';
+      if(!await showConfirm(msg)) return;
       try{
+        for(const p of linkedPayouts) await api('DELETE','/api/payouts/'+p.id);
         await api('DELETE','/api/partners/'+b.dataset.delpartner);
         await refreshState();
         showToast('Commission agent deleted');
@@ -5559,6 +5624,7 @@ function renderExpenses(main){
       if(!desc || !date){ await showAlert('Please fill all required fields'); return; }
       if(!isPositiveAmount(amount)){ await showAlert('Amount must be greater than zero'); return; }
       if(mode==='supplier' && !supplier){ await showAlert('Choose which supplier to credit'); return; }
+      if(mode==='supplier' && !supplierNames().some(n=>n.toLowerCase()===supplier.toLowerCase())){ await showAlert(`"${supplier}" is not a known supplier — pick one from the suggestions (it must already have a purchase or a Master Record entry).`); return; }
       const body = {date, desc, amount, mode, note, excludeFromProfit};
       if(mode==='cash') body.account = account; else body.supplier = supplier;
       try {
@@ -6191,6 +6257,7 @@ function renderSettings(main){
       const balance = Number(main.querySelector('#b_balance').value)||0;
       const locker = main.querySelector('#b_locker').checked;
       if(!name){ await showAlert('Enter a bank/account name'); return; }
+      if(!isNonNegativeAmount(balance)){ await showAlert('Opening Balance must be zero or greater'); return; }
       try{
         if(editingBank){
           await api('PATCH','/api/banks/'+editingBank.id, {name, openingBalance:balance, locker});
