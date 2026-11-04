@@ -1961,6 +1961,25 @@ function partyRecoverySummary(){
     .filter(v=>v.overdue>0 || v.dueSoon>0)
     .sort((a,b)=> b.overdue - a.overdue || b.dueSoon - a.dueSoon);
 }
+// Party Ledger JPG export: the same two data sources as partyRecoverySummary
+// above (credit sales + opening-balance recovery), but for ONE party and
+// bucketed into just Overdue (past due) vs Pending (not yet due, including
+// no due date at all) — not the Dashboard's separate "due soon" window,
+// since the export is meant to show the party everything they still owe,
+// not just what's about to come due.
+function partyOverduePendingSplit(party){
+  let overdue = 0, pending = 0;
+  state.sales.filter(s=>s.party===party && s.type==='credit').forEach(s=>{
+    const outstanding = creditSaleOutstanding(s);
+    if(outstanding<=0.009) return;
+    if(s.dueDate && daysUntil(s.dueDate)<0) overdue += outstanding; else pending += outstanding;
+  });
+  const p = state.parties.find(x=>x.name===party);
+  if(p && Number(p.openingBalance)>0 && partyPendingTotal(party)>0){
+    if(p.dueDate && daysUntil(p.dueDate)<0) overdue += Number(p.openingBalance); else pending += Number(p.openingBalance);
+  }
+  return {overdue, pending};
+}
 // Stock qty/avgCost is always fully rebuilt from the current purchases + sales
 // arrays (never patched incrementally) — this keeps average cost mathematically
 // correct (a plain weighted average is order-independent) no matter how many
@@ -2282,9 +2301,23 @@ function booksBalanceCheck(){
   // Surfacing the current locker total lets that be read directly instead
   // of looking like an unexplained leak.
   const lockerTotal = state.banks.filter(b=>b.locker).reduce((a,b)=>a+accountBalance(b.id),0);
+  // QA Round 24, Item 4: informational only, same treatment as lockerTotal
+  // above — NOT folded into either method's own math. A "One-time balance
+  // adjustment" (the checkbox on Expenses/Misc. Income) deliberately stays
+  // out of Method B's profit/expenses on purpose (it isn't real trading
+  // activity — see totalExpensesAll/totalMiscIncomeAll), but it DOES move
+  // real cash, so Method A sees it. When a one-time adjustment is entered
+  // on its own, with nothing else in the same session to balance it, this
+  // is exactly the size of gap that opens up — surfacing the net total
+  // here explains it directly instead of leaving the owner to guess,
+  // mirroring the existing Suspense Account line's own treatment of a
+  // known, explained plug rather than an unexplained one.
+  const oneTimeExpenses = state.expenses.filter(e=>e.excludeFromProfit).reduce((a,e)=>a+Number(e.amount),0);
+  const oneTimeMiscIncome = state.miscIncome.filter(m=>m.excludeFromProfit).reduce((a,m)=>a+Number(m.amount),0);
+  const oneTimeAdjustments = oneTimeMiscIncome - oneTimeExpenses;
 
   return {
-    methodA, methodB, difference: methodA - methodB, lockerTotal,
+    methodA, methodB, difference: methodA - methodB, lockerTotal, oneTimeAdjustments,
     a: { cashAndBanks, stock, receivable, supplierAdvances, payable, commissionOwed, loansOutstanding, buyerAdvances, suspenseAccount },
     b: { openingNetWorth, investmentLive, profit, expenses, commissionNew, investorPayouts }
   };
@@ -2532,6 +2565,197 @@ function drawBooksBalanceCheckCanvas(bbc){
 }
 function downloadBooksBalanceCheckImage(bbc, dir){
   return downloadCanvasAsJpg(drawBooksBalanceCheckCanvas(bbc), `Books-Balance-Check-${todayStr()}_${fsTimeSuffix()}.jpg`, dir);
+}
+// A single buyer's statement, meant to be sent TO that buyer — every bill
+// with what's been received against it and what's still outstanding, with
+// Receivable/Overdue/Pending totalled at the top (same split as the
+// Dashboard's Recovery boxes, see partyOverduePendingSplit). Height is
+// computed from the row count instead of fixed, since a party's bill count
+// varies a lot (unlike the fixed-shape summary reports above).
+function drawPartyLedgerCanvas(party){
+  // QA feedback 2026-11-04 (round 5): round 4 removed the top cards
+  // entirely — too much. Three cards belong back, renamed and re-purposed
+  // from the original Receivable/Overdue/Pending boxes: Total Payment
+  // (everything still owed, = partyPendingTotal), Due Payment (the overdue
+  // portion of that), Pending Payment (the not-yet-due portion) — the
+  // Returned column and the old Total Credit Sales/Total Received/Pending
+  // Balance cards from round 3 stay removed, per round 4's own request.
+  // QA feedback 2026-11-04 (round 6): a fully-cleared bill (or a cash sale,
+  // which carries the same 'clear' status — see partyLedgerRows) has
+  // nothing left to show the party, so it's left out of the table here —
+  // Overdue/Pending/Partial stay, same as every round before this one.
+  const rows = partyLedgerRows(party).filter(r => r.status !== 'clear');
+  const { overdue, pending } = partyOverduePendingSplit(party);
+  const totalPayment = partyPendingTotal(party);
+
+  const W = 960;
+  const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+  const ROW_H = 32;
+  const TOP = 40+28+34 /*title + as-of*/ + 80+30 /*cards*/ + 34 /*table head*/;
+  const bodyRows = Math.max(1, rows.length);
+  const H = TOP + bodyRows*ROW_H + 24;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0,0,W,H);
+  ctx.textBaseline = 'alphabetic';
+
+  let y = 40;
+  ctx.fillStyle = '#111111';
+  ctx.font = `bold 22px ${FONT}`;
+  ctx.textAlign = 'left';
+  ctx.fillText(`${party} — Sales`, 32, y);
+  y += 28;
+  ctx.font = `13px ${FONT}`;
+  ctx.fillStyle = '#888888';
+  ctx.fillText(`As of: ${fmtDate(todayStr())}`, 32, y);
+  y += 34;
+
+  // ---- top cards: Total Payment / Overdue Date / Pending Payment ----
+  // QA feedback 2026-11-04 (round 7): the middle card's heading is now
+  // "Overdue Date" (its own wording, even though the value is still an
+  // amount, not a date — flagged back to them rather than silently
+  // changed to "Overdue Amount"), and it + the Pending Payment card are
+  // now fully tinted (background and border), not just their value text —
+  // same pink/yellow pair the Dashboard's Reminders already use.
+  const cardDefs = [
+    {label:'Total Payment', value: totalPayment, color:'#111111', bg:'#ffffff', border:'#e2e2e2'},
+    {label:'Overdue Date', value: overdue, color: overdue>0.009 ? '#991B1B' : '#111111', bg: overdue>0.009 ? '#FEF2F2' : '#ffffff', border: overdue>0.009 ? '#FECACA' : '#e2e2e2'},
+    {label:'Pending Payment', value: pending, color: pending>0.009 ? '#92400E' : '#111111', bg: pending>0.009 ? '#FFFBEB' : '#ffffff', border: pending>0.009 ? '#FDE68A' : '#e2e2e2'}
+  ];
+  const cardGap = 16;
+  const cardW = (W - 64 - cardGap*(cardDefs.length-1)) / cardDefs.length;
+  cardDefs.forEach((c,i)=>{
+    const bx = 32 + i*(cardW+cardGap);
+    ctx.fillStyle = c.bg;
+    ctx.fillRect(bx, y, cardW, 80);
+    ctx.strokeStyle = c.border;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(bx, y, cardW, 80);
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#666666';
+    ctx.font = `13px ${FONT}`;
+    ctx.fillText(c.label, bx+14, y+26);
+    ctx.fillStyle = c.color;
+    ctx.font = `bold 21px ${FONT}`;
+    ctx.fillText('Rs ' + fmtPlain(c.value), bx+14, y+58);
+  });
+  y += 80 + 30;
+
+  // ---- Sales table: same columns, same order, same rows as on screen
+  // (minus the Returned column, dropped on request) ----
+  const cols = [
+    {key:'date', label:'Date', w:84},
+    {key:'item', label:'Item', w:160},
+    {key:'qty', label:'Qty', w:90},
+    {key:'total', label:'Total', w:106},
+    {key:'received', label:'Received', w:100},
+    {key:'outstanding', label:'Outstanding', w:112},
+    {key:'status', label:'Status', w:120},
+    {key:'due', label:'Due Date', w:88}
+  ];
+  const colX = [];
+  { let cx = 32; cols.forEach(c=>{ colX.push(cx); cx += c.w; }); }
+
+  ctx.font = `600 11px ${FONT}`;
+  ctx.fillStyle = '#888888';
+  ctx.textAlign = 'left';
+  cols.forEach((c,i)=> ctx.fillText(c.label.toUpperCase(), colX[i], y));
+  y += 10;
+  ctx.strokeStyle = '#e4e4e4';
+  ctx.beginPath(); ctx.moveTo(32,y); ctx.lineTo(W-32,y); ctx.stroke();
+  y += 24;
+
+  function truncate(text, maxWidth, font){
+    ctx.font = font;
+    const s = String(text);
+    if(ctx.measureText(s).width <= maxWidth) return s;
+    let t = s;
+    while(t.length>1 && ctx.measureText(t+'…').width > maxWidth) t = t.slice(0,-1);
+    return t + '…';
+  }
+  // a money value is never truncated with "…" (misleading on an amount) —
+  // shrink the font a step at a time instead, which a normal-width Rupee
+  // figure in these column widths should never actually need.
+  function fitText(text, maxWidth, baseSize){
+    let size = baseSize;
+    while(size > 9){
+      ctx.font = `${size}px ${FONT}`;
+      if(ctx.measureText(text).width <= maxWidth) break;
+      size -= 1;
+    }
+    return `${size}px ${FONT}`;
+  }
+  function drawPill(text, x, bg, fg){
+    const font = `600 11px ${FONT}`;
+    ctx.font = font;
+    const padX = 9, pillH = 19;
+    const textW = ctx.measureText(text).width;
+    const py = y - pillH + 6;
+    ctx.fillStyle = bg;
+    if(ctx.roundRect){ ctx.beginPath(); ctx.roundRect(x, py, textW+padX*2, pillH, 10); ctx.fill(); }
+    else ctx.fillRect(x, py, textW+padX*2, pillH);
+    ctx.fillStyle = fg;
+    ctx.textAlign = 'left';
+    ctx.fillText(text, x+padX, y);
+  }
+
+  if(!rows.length){
+    ctx.font = `14px ${FONT}`;
+    ctx.fillStyle = '#888888';
+    ctx.fillText('Nothing outstanding — fully settled', 32, y);
+    y += ROW_H;
+  } else {
+    rows.forEach(r=>{
+      const outstanding = r.effectiveTotal - r.received;
+      let statusLabel, statusBg, statusFg;
+      if(r.status==='clear'){ statusLabel='Clear'; statusBg='#DCFCE7'; statusFg='#15803D'; }
+      else if(r.status==='partial'){ statusLabel='Partially Received'; statusBg='#FDE7C8'; statusFg='#8A5A12'; }
+      else if(r.sale.type==='cash'){ statusLabel='Cash'; statusBg='#DCFCE7'; statusFg='#15803D'; }
+      else {
+        const isOverdue = r.sale.dueDate && daysUntil(r.sale.dueDate) < 0;
+        statusLabel = isOverdue ? 'Overdue' : 'Pending';
+        statusBg = isOverdue ? '#FEF2F2' : '#FFFBEB';
+        statusFg = isOverdue ? '#991B1B' : '#92400E';
+      }
+      const baseFont = `13px ${FONT}`;
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#111111';
+
+      ctx.font = baseFont;
+      ctx.fillText(fmtDate(r.sale.date), colX[0], y);
+      ctx.fillText(truncate(r.sale.item, cols[1].w-8, baseFont), colX[1], y);
+      ctx.fillText(truncate(fmtQtyPlain(r.sale.qty)+' '+(r.sale.unit||'kg'), cols[2].w-8, baseFont), colX[2], y);
+
+      const totalText = 'Rs ' + fmtPlain(r.sale.total);
+      ctx.font = fitText(totalText, cols[3].w-8, 13);
+      ctx.fillText(totalText, colX[3], y);
+
+      const receivedText = 'Rs ' + fmtPlain(r.received);
+      ctx.font = fitText(receivedText, cols[4].w-8, 13);
+      ctx.fillText(receivedText, colX[4], y);
+
+      const outstandingText = 'Rs ' + fmtPlain(outstanding);
+      ctx.font = fitText(outstandingText, cols[5].w-8, 13);
+      ctx.fillText(outstandingText, colX[5], y);
+
+      drawPill(statusLabel, colX[6], statusBg, statusFg);
+
+      ctx.font = baseFont;
+      ctx.fillStyle = '#111111';
+      ctx.textAlign = 'left';
+      ctx.fillText(r.sale.type==='credit' && r.sale.dueDate ? fmtDate(r.sale.dueDate) : '—', colX[7], y);
+
+      y += ROW_H;
+    });
+  }
+
+  return canvas;
+}
+function downloadPartyLedgerImage(party, dir){
+  return downloadCanvasAsJpg(drawPartyLedgerCanvas(party), `${party.replace(/[^a-z0-9]+/gi,'-')}-${todayStr()}_${fsTimeSuffix()}.jpg`, dir);
 }
 // generic "download any canvas as JPG" — shared by Trade Summary and
 // Investor Summary saves. Where the browser supports it (the File System
@@ -3822,6 +4046,11 @@ function renderBuyerLedger(main, ro){
       <div class="form-grid" style="margin-bottom:0;">
         <div><label>Party</label><select id="lg_party"><option value="">— select a party —</option><option value="__all__">All Parties</option>${parties.map(p=>`<option value="${p}" ${p===ledgerParty?'selected':''}>${p}</option>`).join('')}</select></div>
       </div>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px;">
+        <button class="btn gold" id="pl_save">Download Ledger as JPG</button>
+        <button class="btn danger" id="pl_change_location">Change Save Location</button>
+      </div>
+      <div class="settings-note" style="margin-top:8px;">${!fsApiSupported() ? 'Your browser doesn\'t support choosing a save folder, so downloads go to your default Downloads folder (use Chrome or Edge for folder selection).' : fsSavedDirName ? `Saving to folder: <b>${fsSavedDirName}</b> (same folder used for Trade Summary, Investor Summary and Books Balance Check) — each save gets its own time-stamped file. Use "Change Save Location" to pick a different folder.` : 'No folder chosen yet — the first save will ask where to save, then remember it.'}</div>
     </section>
     <div class="cards">
       <div class="card"><div class="label">Total Credit Sales</div><div class="value">Rs ${fmt(creditTotal)}</div></div>
@@ -3869,6 +4098,26 @@ function renderBuyerLedger(main, ro){
   main.querySelectorAll('[data-viewparty]').forEach(b=>{
     b.onclick = ()=>{ ledgerParty = b.dataset.viewparty; render(); };
   });
+  // exporting a ledger is a read action, same as the rest of Reports — not
+  // gated behind edit access, so wire these before the `if(ro) return;` below.
+  if(main.querySelector('#pl_save')){
+    main.querySelector('#pl_save').onclick = async()=>{
+      // resolve the save folder FIRST, right on the click — same reasoning
+      // as Trade Summary/Books Balance Check's save buttons (see their
+      // comments): Chrome only honors the folder-permission prompt as a
+      // genuine user gesture for a very short window right after the click.
+      const dir = await fsResolveSaveDir(false);
+      try{
+        await downloadPartyLedgerImage(ledgerParty, dir);
+        showToast(dir ? `Ledger saved to folder "${dir.name}"` : 'Ledger saved and downloaded');
+      }catch(e){ await showAlert(e.message||'Could not save the ledger'); }
+    };
+    main.querySelector('#pl_change_location').onclick = async()=>{
+      if(!fsApiSupported()){ await showAlert("Your browser doesn't support choosing a save folder. Use Chrome or Edge for this, or just use your browser's normal Downloads folder."); return; }
+      const dir = await fsResolveSaveDir(true);
+      if(dir){ showToast(`Save location updated to "${dir.name}" — future downloads will go there`); render(); }
+    };
+  }
   if(ro) return;
   main.querySelectorAll('[data-redit]').forEach(b=>{
     b.onclick = async ()=>{
@@ -5820,8 +6069,10 @@ function renderReports(main){
         <div class="card"><div class="label">Method B — Investment + Gross Profit − Expenses − Commission</div><div class="value">Rs ${fmt(bbc.methodB)}</div></div>
         <div class="card ${bbcOk?'':'warn'}"><div class="label">Difference</div><div class="value">${bbcOk?'<span class="pill ok">✓ Balanced</span>':`<span class="pill due">Rs ${fmt(Math.abs(bbc.difference))} ${bbc.difference>0?'unexplained surplus':'unexplained gap'}</span>`}</div></div>
         ${bbc.lockerTotal>0?`<div class="card"><div class="label">Currently in Lockers</div><div class="value">Rs ${fmt(bbc.lockerTotal)}</div></div>`:''}
+        ${Math.abs(bbc.oneTimeAdjustments)>0.009?`<div class="card"><div class="label">One-time Balance Adjustments (net)</div><div class="value">Rs ${fmt(bbc.oneTimeAdjustments)}</div></div>`:''}
       </div>
       ${(!bbcOk && bbc.lockerTotal>0 && Math.abs(Math.abs(bbc.difference)-bbc.lockerTotal)<1) ? `<div class="settings-note" style="margin-top:-4px;margin-bottom:12px;">This gap is exactly the amount currently sitting in Lockers — it means a Transfer has moved that much money between a tracked account and a Locker. Lockers are excluded from both methods on purpose (see note below), so this is expected, not an error.</div>` : ''}
+      ${(!bbcOk && Math.abs(bbc.oneTimeAdjustments)>0.009 && Math.abs(bbc.difference-bbc.oneTimeAdjustments)<1) ? `<div class="settings-note" style="margin-top:-4px;margin-bottom:12px;">This gap is exactly the net total of "One-time balance adjustment" entries on Expenses/Misc. Income — they move real cash but are deliberately excluded from Gross Profit (see the checkbox on those screens), so Method A sees them and Method B doesn't. This is expected, not an error.</div>` : ''}
       <div style="overflow-x:auto;">
       <table>
         <thead><tr><th>Method A — Today's Balances</th><th>Amount</th><th>Method B — Investment + Gross Profit − Expenses − Commission − Investor Payouts</th><th>Amount</th></tr></thead>

@@ -799,6 +799,17 @@ async function ensureSchema() {
     -- friendly error — this index is only the race-safe backstop).
     CREATE UNIQUE INDEX IF NOT EXISTS partners_client_name_ci_idx ON partners (client_id, LOWER(TRIM(name)));
     CREATE UNIQUE INDEX IF NOT EXISTS bank_accounts_client_name_ci_idx ON bank_accounts (client_id, LOWER(TRIM(name)));
+    -- QA Round 24, Item 3: parties/suppliers/materials blocked an EXACT
+    -- duplicate name (their own plain UNIQUE constraint from before this
+    -- case-insensitive pattern existed), but "qa test supplier a" and "QA
+    -- Test Supplier A" counted as different names and both got created.
+    -- Same race-safe-backstop-index-plus-friendly-app-check shape as
+    -- partners/bank_accounts above; materials keep unit out of the
+    -- case-folding since two different units for the same name are
+    -- legitimately separate stock rows.
+    CREATE UNIQUE INDEX IF NOT EXISTS parties_client_name_ci_idx ON parties (client_id, LOWER(TRIM(name)));
+    CREATE UNIQUE INDEX IF NOT EXISTS suppliers_client_name_ci_idx ON suppliers (client_id, LOWER(TRIM(name)));
+    CREATE UNIQUE INDEX IF NOT EXISTS stock_client_name_unit_ci_idx ON stock (client_id, LOWER(TRIM(name)), unit);
   `);
 }
 
@@ -1975,7 +1986,7 @@ app.post('/api/sales-returns', ...editorAccess, async (req, res) => {
         const alreadyRefunded = Number((await db.query("SELECT COALESCE(SUM(total),0) s FROM sales_returns WHERE sale_id=$1 AND settlement='refund'", [x.saleId])).rows[0].s);
         const refundable = applied - alreadyRefunded;
         if (total > refundable + 0.009) {
-          const e = new Error(`Only Rs ${Math.max(0, refundable).toFixed(2)} of this sale can still be refunded (Rs ${applied.toFixed(2)} received so far${alreadyRefunded > 0.009 ? `, Rs ${alreadyRefunded.toFixed(2)} already refunded` : ''}) — a Refund can't pay out more than that. Use Credit instead (it reduces what they still owe), or reduce the quantity.`);
+          const e = new Error(`Only Rs ${fmtMoneyServer(Math.max(0, refundable))} of this sale can still be refunded (Rs ${fmtMoneyServer(applied)} received so far${alreadyRefunded > 0.009 ? `, Rs ${fmtMoneyServer(alreadyRefunded)} already refunded` : ''}) — a Refund can't pay out more than that. Use Credit instead (it reduces what they still owe), or reduce the quantity.`);
           e.code = 'NEGATIVE_STOCK';
           throw e;
         }
@@ -2303,6 +2314,25 @@ app.post('/api/purchase-returns', ...editorAccess, async (req, res) => {
       }
       const rate = Number(purchase.rate);
       const total = Number(x.qty) * rate;
+      // QA Round 24, Item 1: a Refund on a credit purchase increased the
+      // bank AND reduced the payable, double-counting the same money —
+      // mirrors QA Round 23's Item 3 fix on the sales side exactly. Cap
+      // the refund at what's actually been paid on THIS purchase so far
+      // (same FIFO-applied figure the Supplier Ledger already uses),
+      // minus whatever's already been refunded against it. Cash purchases
+      // are untouched — supplierPurchaseFifoAppliedDb always returns 0 for
+      // them (they never draw from the payments pool), so this check only
+      // ever applies to credit purchases, same scoping as the sales side.
+      if (x.settlement === 'refund' && purchase.type === 'credit') {
+        const applied = await supplierPurchaseFifoAppliedDb(db, req.clientId, purchase.supplier, x.purchaseId);
+        const alreadyRefunded = Number((await db.query("SELECT COALESCE(SUM(total),0) s FROM purchase_returns WHERE purchase_id=$1 AND settlement='refund'", [x.purchaseId])).rows[0].s);
+        const refundable = applied - alreadyRefunded;
+        if (total > refundable + 0.009) {
+          const e = new Error(`Only Rs ${fmtMoneyServer(Math.max(0, refundable))} of this purchase can still be refunded (Rs ${fmtMoneyServer(applied)} paid so far${alreadyRefunded > 0.009 ? `, Rs ${fmtMoneyServer(alreadyRefunded)} already refunded` : ''}) — a Refund can't pay out more than that. Use Credit instead (it reduces what you still owe), or reduce the quantity.`);
+          e.code = 'NEGATIVE_STOCK';
+          throw e;
+        }
+      }
       const id = crypto.randomUUID();
       const r = await db.query(
         `INSERT INTO purchase_returns (id, client_id, date, purchase_id, qty, rate, total, settlement, account_id, note)
@@ -2855,13 +2885,16 @@ app.post('/api/parties', ...editorAccess, async (req, res) => {
     return res.status(400).json({ error: 'Opening Balance must be zero or greater' });
   }
   try {
-    const row = await withTenantDb(req.clientId, (db) =>
-      db.query('INSERT INTO parties (id,client_id,name,opening_balance,due_date) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-        [crypto.randomUUID(), req.clientId, name, Number(x.openingBalance) || 0, x.dueDate || null]).then((r) => r.rows[0])
-    );
+    const row = await withTenantDb(req.clientId, async (db) => {
+      // QA Round 24, Item 3: case-insensitive, same pattern as partners/banks.
+      const dup = await db.query('SELECT 1 FROM parties WHERE client_id=$1 AND LOWER(TRIM(name))=LOWER(TRIM($2))', [req.clientId, name]);
+      if (dup.rows[0]) { const e = new Error('A party with this name already exists'); e.code = 'DUPLICATE_NAME'; throw e; }
+      return db.query('INSERT INTO parties (id,client_id,name,opening_balance,due_date) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+        [crypto.randomUUID(), req.clientId, name, Number(x.openingBalance) || 0, x.dueDate || null]).then((r) => r.rows[0]);
+    });
     res.json(mapParty(row));
   } catch (err) {
-    if (err.code === '23505') return res.status(409).json({ error: 'A party with this name already exists' });
+    if (err.code === 'DUPLICATE_NAME' || err.code === '23505') return res.status(409).json({ error: 'A party with this name already exists' });
     console.error('POST /api/parties error:', err);
     res.status(500).json({ error: 'Unable to add party' });
   }
@@ -2877,8 +2910,11 @@ app.patch('/api/parties/:id', ...editorAccess, async (req, res) => {
       const before = await db.query('SELECT * FROM parties WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       if (!before.rows[0]) return null;
       const old = before.rows[0];
+      const newName = (x.name || old.name).trim();
+      const dup = await db.query('SELECT 1 FROM parties WHERE client_id=$1 AND id<>$2 AND LOWER(TRIM(name))=LOWER(TRIM($3))', [req.clientId, req.params.id, newName]);
+      if (dup.rows[0]) { const e = new Error('A party with this name already exists'); e.code = 'DUPLICATE_NAME'; throw e; }
       const r = await db.query('UPDATE parties SET name=$1, opening_balance=$2, due_date=$3 WHERE id=$4 AND client_id=$5 RETURNING *',
-        [(x.name || old.name).trim(), Number(x.openingBalance) || 0, x.dueDate || null, req.params.id, req.clientId]);
+        [newName, Number(x.openingBalance) || 0, x.dueDate || null, req.params.id, req.clientId]);
       await writeAudit(db, req.clientId, 'party', 'edit', {
         before: { name: old.name, openingBalance: old.opening_balance },
         after: { name: r.rows[0].name, openingBalance: r.rows[0].opening_balance }
@@ -2888,7 +2924,7 @@ app.patch('/api/parties/:id', ...editorAccess, async (req, res) => {
     if (!row) return res.status(404).json({ error: 'Party not found' });
     res.json(mapParty(row));
   } catch (err) {
-    if (err.code === '23505') return res.status(409).json({ error: 'A party with this name already exists' });
+    if (err.code === 'DUPLICATE_NAME' || err.code === '23505') return res.status(409).json({ error: 'A party with this name already exists' });
     console.error('PATCH /api/parties/:id error:', err);
     res.status(500).json({ error: 'Unable to update party' });
   }
@@ -2921,13 +2957,16 @@ app.post('/api/suppliers', ...editorAccess, async (req, res) => {
     return res.status(400).json({ error: 'Opening Balance must be zero or greater' });
   }
   try {
-    const row = await withTenantDb(req.clientId, (db) =>
-      db.query('INSERT INTO suppliers (id,client_id,name,opening_balance,due_date) VALUES ($1,$2,$3,$4,$5) RETURNING *',
-        [crypto.randomUUID(), req.clientId, name, Number(x.openingBalance) || 0, x.dueDate || null]).then((r) => r.rows[0])
-    );
+    const row = await withTenantDb(req.clientId, async (db) => {
+      // QA Round 24, Item 3: case-insensitive, same pattern as partners/banks.
+      const dup = await db.query('SELECT 1 FROM suppliers WHERE client_id=$1 AND LOWER(TRIM(name))=LOWER(TRIM($2))', [req.clientId, name]);
+      if (dup.rows[0]) { const e = new Error('A supplier with this name already exists'); e.code = 'DUPLICATE_NAME'; throw e; }
+      return db.query('INSERT INTO suppliers (id,client_id,name,opening_balance,due_date) VALUES ($1,$2,$3,$4,$5) RETURNING *',
+        [crypto.randomUUID(), req.clientId, name, Number(x.openingBalance) || 0, x.dueDate || null]).then((r) => r.rows[0]);
+    });
     res.json(mapSupplier(row));
   } catch (err) {
-    if (err.code === '23505') return res.status(409).json({ error: 'A supplier with this name already exists' });
+    if (err.code === 'DUPLICATE_NAME' || err.code === '23505') return res.status(409).json({ error: 'A supplier with this name already exists' });
     console.error('POST /api/suppliers error:', err);
     res.status(500).json({ error: 'Unable to add supplier' });
   }
@@ -2943,8 +2982,11 @@ app.patch('/api/suppliers/:id', ...editorAccess, async (req, res) => {
       const before = await db.query('SELECT * FROM suppliers WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
       if (!before.rows[0]) return null;
       const old = before.rows[0];
+      const newName = (x.name || old.name).trim();
+      const dup = await db.query('SELECT 1 FROM suppliers WHERE client_id=$1 AND id<>$2 AND LOWER(TRIM(name))=LOWER(TRIM($3))', [req.clientId, req.params.id, newName]);
+      if (dup.rows[0]) { const e = new Error('A supplier with this name already exists'); e.code = 'DUPLICATE_NAME'; throw e; }
       const r = await db.query('UPDATE suppliers SET name=$1, opening_balance=$2, due_date=$3 WHERE id=$4 AND client_id=$5 RETURNING *',
-        [(x.name || old.name).trim(), Number(x.openingBalance) || 0, x.dueDate || null, req.params.id, req.clientId]);
+        [newName, Number(x.openingBalance) || 0, x.dueDate || null, req.params.id, req.clientId]);
       await writeAudit(db, req.clientId, 'supplier', 'edit', {
         before: { name: old.name, openingBalance: old.opening_balance },
         after: { name: r.rows[0].name, openingBalance: r.rows[0].opening_balance }
@@ -2954,7 +2996,7 @@ app.patch('/api/suppliers/:id', ...editorAccess, async (req, res) => {
     if (!row) return res.status(404).json({ error: 'Supplier not found' });
     res.json(mapSupplier(row));
   } catch (err) {
-    if (err.code === '23505') return res.status(409).json({ error: 'A supplier with this name already exists' });
+    if (err.code === 'DUPLICATE_NAME' || err.code === '23505') return res.status(409).json({ error: 'A supplier with this name already exists' });
     console.error('PATCH /api/suppliers/:id error:', err);
     res.status(500).json({ error: 'Unable to update supplier' });
   }
@@ -2989,7 +3031,9 @@ app.post('/api/stock', ...editorAccess, async (req, res) => {
   if (Number(x.openingQty) < 0 || Number(x.openingRate) < 0) return res.status(400).json({ error: 'Opening quantity/rate cannot be negative' });
   try {
     const result = await withTenantDb(req.clientId, async (db) => {
-      const existing = await db.query('SELECT id FROM stock WHERE client_id=$1 AND name=$2 AND unit=$3', [req.clientId, name, unit]);
+      // QA Round 24, Item 3: was an exact-match check — "qa test yarn" and
+      // "QA Test Yarn" counted as different items. Case-insensitive, trimmed.
+      const existing = await db.query('SELECT id FROM stock WHERE client_id=$1 AND LOWER(TRIM(name))=LOWER(TRIM($2)) AND unit=$3', [req.clientId, name, unit]);
       if (existing.rows[0]) { const e = new Error('EXISTS'); e.code = 'EXISTS'; throw e; }
       await db.query(
         'INSERT INTO stock (id, client_id, name, unit, opening_qty, opening_rate) VALUES ($1,$2,$3,$4,$5,$6)',
