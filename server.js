@@ -1150,10 +1150,13 @@ async function supplierPurchaseFifoAppliedDb(db, clientId, supplier, purchaseId)
     "SELECT COALESCE(SUM(amount),0) s FROM misc_income WHERE client_id=$1 AND mode='supplier' AND supplier=$2",
     [clientId, supplier]
   );
-  // same principle as the sales side above: a return always shrinks THIS
-  // purchase's own effective total first, rather than joining the pool.
+  // QA Round 25, Bug A: only a 'credit'-settled return actually shrinks what's
+  // still owed on this purchase — a 'refund' pays real cash back directly
+  // (handled separately by computeAccountBalanceDb) and must not also shrink
+  // the payable basis here, or the same money gets counted twice. Mirrors
+  // supplierCreditPurchasesTotal/supplierLedgerRows on the frontend exactly.
   const returnsRes = await db.query(
-    `SELECT purchase_id, COALESCE(SUM(total),0) s FROM purchase_returns WHERE purchase_id IN
+    `SELECT purchase_id, COALESCE(SUM(total),0) s FROM purchase_returns WHERE settlement='credit' AND purchase_id IN
      (SELECT id FROM purchases WHERE client_id=$1 AND supplier=$2) GROUP BY purchase_id`,
     [clientId, supplier]
   );

@@ -1701,6 +1701,16 @@ function saleCreditReturnsTotal(saleId){
 function purchaseReturnsTotal(purchaseId){
   return state.purchaseReturns.filter(r=>r.purchaseId===purchaseId).reduce((a,r)=>a+Number(r.total),0);
 }
+// QA Round 25, Bug A: the mirror-image of saleCreditReturnsTotal above — a
+// refund-settled purchase return pays real cash back into the bank directly
+// (already counted there), so folding it into the payable/pending math too
+// double-counted it. Only a 'credit' settlement actually reduces what's
+// still owed to the supplier; used strictly for payable-purpose call sites
+// below, while purchaseReturnsTotal (both settlements) stays correct for
+// stock/COGS/display purposes.
+function purchaseCreditReturnsTotal(purchaseId){
+  return state.purchaseReturns.filter(r=>r.purchaseId===purchaseId && r.settlement==='credit').reduce((a,r)=>a+Number(r.total),0);
+}
 // a completed Supplier Advance always settles its own linked purchase
 // first — same per-record principle as a return, never pooled, so the
 // money can never land against some other, unrelated purchase.
@@ -1772,7 +1782,7 @@ function supplierAdvanceExcessTotal(supplier){
 }
 function supplierCreditPurchasesTotal(supplier){
   return state.purchases.filter(p=>p.supplier===supplier && p.type==='credit' && !p.paid)
-    .reduce((a,p)=>a+Math.max(0, Number(p.total)-purchaseReturnsTotal(p.id)-purchaseAdvanceAppliedFor(p.id)),0);
+    .reduce((a,p)=>a+Math.max(0, Number(p.total)-purchaseCreditReturnsTotal(p.id)-purchaseAdvanceAppliedFor(p.id)),0);
 }
 function supplierPendingTotal(supplier){
   return Math.max(0, supplierOpeningBalance(supplier) + supplierCreditPurchasesTotal(supplier) - supplierPaymentsTotal(supplier));
@@ -1792,7 +1802,7 @@ function supplierLedgerRows(supplier){
     // accountBalance) — a 'credit' settlement is blocked server-side for
     // exactly this case, since shrinking its total here would have no effect.
     if(p.type==='cash' || p.paid){ return {purchase:p, paid:Number(p.total), status:'clear', effectiveTotal:Number(p.total)}; }
-    const total = Math.max(0, Number(p.total) - purchaseReturnsTotal(p.id) - purchaseAdvanceAppliedFor(p.id));
+    const total = Math.max(0, Number(p.total) - purchaseCreditReturnsTotal(p.id) - purchaseAdvanceAppliedFor(p.id));
     const applied = Math.min(pool, total);
     pool -= applied;
     const status = total<=0.009 ? 'clear' : (applied<=0 ? 'pending' : (applied<total ? 'partial' : 'clear'));
@@ -1807,7 +1817,7 @@ function creditPurchaseStatus(purchase){
 function creditPurchaseOutstanding(purchase){
   if(purchase.type!=='credit' || purchase.paid) return 0;
   const row = supplierLedgerRows(purchase.supplier).find(r=>r.purchase.id===purchase.id);
-  return row ? row.effectiveTotal - row.paid : Math.max(0, Number(purchase.total)-purchaseReturnsTotal(purchase.id)-purchaseAdvanceAppliedFor(purchase.id));
+  return row ? row.effectiveTotal - row.paid : Math.max(0, Number(purchase.total)-purchaseCreditReturnsTotal(purchase.id)-purchaseAdvanceAppliedFor(purchase.id));
 }
 function payableDueTotal(){
   return supplierNames().reduce((a,s)=>a + supplierPendingTotal(s), 0);
