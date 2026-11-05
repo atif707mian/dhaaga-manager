@@ -84,7 +84,14 @@
   section.block{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);
     padding:18px 20px;margin-bottom:16px;box-shadow:var(--shadow);}
   section.block h2{font-size:15.5px;margin:0 0 14px;color:var(--ink);font-weight:700;letter-spacing:.1px;}
-  .form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:14px;}
+  .form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:12px;margin-bottom:14px;}
+  /* a label long enough to wrap onto two lines (e.g. "Bank Name (cheque
+     drawn on)") used to push its OWN input/select down below the row's
+     other, single-line-label boxes — same grid row, but the box itself
+     sat lower. Anchoring every field wrapper's content to the bottom
+     keeps every input/select on one shared baseline regardless of how
+     many lines its label needs; the label is free to sit higher instead. */
+  .form-grid > div{display:flex;flex-direction:column;justify-content:flex-end;}
   label{display:block;font-size:12px;color:var(--ink-soft);margin-bottom:5px;font-weight:500;}
   input,select{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;
     font-family:inherit;font-size:14px;background:var(--panel);color:var(--ink);transition:border-color .12s,box-shadow .12s;}
