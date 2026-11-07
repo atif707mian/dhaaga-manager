@@ -377,9 +377,9 @@ function receivingReportTransactions(matchesDate){
     .map(r=>({
       date: r.date, party: r.party, amount: Number(r.amount),
       method: (allAccounts().find(a=>a.id===(r.account||'cash'))||{}).name||'Cash',
-      note: r.note||''
+      note: r.note||'', updatedAt: r.updatedAt
     }))
-    .sort((a,b)=> a.date<b.date?-1:a.date>b.date?1:0);
+    .sort((a,b)=> a.date!==b.date ? (a.date<b.date?-1:1) : (a.updatedAt||'')<(b.updatedAt||'')?-1:(a.updatedAt||'')>(b.updatedAt||'')?1:0);
 }
 // Net Worth over time: a line chart (not bars) since this is a running
 // level, not a per-period flow — each point is "net worth as of this
@@ -489,6 +489,19 @@ function isPositiveAmount(v){ const n = Number(v); return Number.isFinite(n) && 
 // for an opening-balance-style field, 0 is a legitimate "no prior history"
 // value — only negative/NaN/Infinity/too-large should be rejected.
 function isNonNegativeAmount(v){ const n = Number(v); return Number.isFinite(n) && n >= 0 && n < MAX_SANE_AMOUNT; }
+// Display-order tiebreaker: "Date" is the business/transaction date, which
+// several records can legitimately share (two receipts on the same day) —
+// sorting newest-first by date alone leaves their relative order undefined.
+// updatedAt (set server-side on create, bumped on every edit) breaks that
+// tie by actual entry/edit recency. Used ONLY for how lists are displayed —
+// never for FIFO/allocation order, which must stay stable regardless of
+// when a record was last touched.
+function byRecencyDesc(a,b){
+  if(!a || !b) return 0;
+  if(a.date !== b.date) return a.date < b.date ? 1 : -1;
+  const au = a.updatedAt || '', bu = b.updatedAt || '';
+  return au < bu ? 1 : au > bu ? -1 : 0;
+}
 function fmt(n){ return `<b>${fmtPlain(n)}</b>`; }
 // quantities/rates (yarn kg, cost per kg) are commonly fractional and were
 // being silently rounded to whole numbers in list views via fmt() — this
@@ -1356,33 +1369,33 @@ function accountLedgerRows(accId){
   accId = accId || 'cash';
   const rows = [];
   state.investors.forEach(i=>{ if(!i.staged && (i.account||'cash')===accId) rows.push({date:'', kind:'Investment', desc:i.name, amount:Number(i.amount)}); });
-  state.personalLoans.forEach(l=>{ if((l.account||'cash')===accId) rows.push({date:l.date, kind:'Personal Loan', desc:l.lender+(l.note?' — '+l.note:''), amount:Number(l.amount)}); });
-  state.sales.forEach(s=>{ if(!s.staged && s.type==='cash' && (s.account||'cash')===accId) rows.push({date:s.date, kind:'Sale (Cash)', desc:s.party+' — '+s.item, amount:Number(s.total)}); });
-  state.receipts.forEach(r=>{ if(!r.staged && (r.account||'cash')===accId) rows.push({date:r.date, kind:'Receipt', desc:r.party+(r.note?' — '+r.note:''), amount:Number(r.amount)}); });
+  state.personalLoans.forEach(l=>{ if((l.account||'cash')===accId) rows.push({date:l.date, kind:'Personal Loan', desc:l.lender+(l.note?' — '+l.note:''), amount:Number(l.amount), updatedAt:l.updatedAt}); });
+  state.sales.forEach(s=>{ if(!s.staged && s.type==='cash' && (s.account||'cash')===accId) rows.push({date:s.date, kind:'Sale (Cash)', desc:s.party+' — '+s.item, amount:Number(s.total), updatedAt:s.updatedAt}); });
+  state.receipts.forEach(r=>{ if(!r.staged && (r.account||'cash')===accId) rows.push({date:r.date, kind:'Receipt', desc:r.party+(r.note?' — '+r.note:''), amount:Number(r.amount), updatedAt:r.updatedAt}); });
   state.purchases.forEach(p=>{
     if(p.staged) return;
-    if(p.type==='cash' && (p.account||'cash')===accId) rows.push({date:p.date, kind:'Purchase (Cash)', desc:p.supplier+' — '+p.item, amount:-Number(p.total)});
-    else if(p.type==='credit' && p.paid && (p.account||'cash')===accId) rows.push({date:p.date, kind:'Purchase (Paid)', desc:p.supplier+' — '+p.item, amount:-Number(p.paidAmount!=null ? p.paidAmount : p.total)});
+    if(p.type==='cash' && (p.account||'cash')===accId) rows.push({date:p.date, kind:'Purchase (Cash)', desc:p.supplier+' — '+p.item, amount:-Number(p.total), updatedAt:p.updatedAt});
+    else if(p.type==='credit' && p.paid && (p.account||'cash')===accId) rows.push({date:p.date, kind:'Purchase (Paid)', desc:p.supplier+' — '+p.item, amount:-Number(p.paidAmount!=null ? p.paidAmount : p.total), updatedAt:p.updatedAt});
   });
-  state.supplierPayments.forEach(p=>{ if(!p.staged && (p.account||'cash')===accId) rows.push({date:p.date, kind:'Payment to Supplier', desc:p.supplier+(p.note?' — '+p.note:''), amount:-Number(p.amount)}); });
-  state.purchaseAdvances.forEach(a=>{ if((a.account||'cash')===accId) rows.push({date:a.date, kind:'Supplier Advance', desc:a.supplier+(a.note?' — '+a.note:''), amount:-Number(a.amount)}); });
-  state.miscIncome.forEach(m=>{ if(m.mode==='cash' && (m.account||'cash')===accId) rows.push({date:m.date, kind:'Misc. Income', desc:m.desc+(m.note?' — '+m.note:''), amount:Number(m.amount)}); });
-  state.expenses.forEach(e=>{ if((e.account||'cash')===accId) rows.push({date:e.date, kind:'Expense', desc:e.desc, amount:-Number(e.amount)}); });
+  state.supplierPayments.forEach(p=>{ if(!p.staged && (p.account||'cash')===accId) rows.push({date:p.date, kind:'Payment to Supplier', desc:p.supplier+(p.note?' — '+p.note:''), amount:-Number(p.amount), updatedAt:p.updatedAt}); });
+  state.purchaseAdvances.forEach(a=>{ if((a.account||'cash')===accId) rows.push({date:a.date, kind:'Supplier Advance', desc:a.supplier+(a.note?' — '+a.note:''), amount:-Number(a.amount), updatedAt:a.updatedAt}); });
+  state.miscIncome.forEach(m=>{ if(m.mode==='cash' && (m.account||'cash')===accId) rows.push({date:m.date, kind:'Misc. Income', desc:m.desc+(m.note?' — '+m.note:''), amount:Number(m.amount), updatedAt:m.updatedAt}); });
+  state.expenses.forEach(e=>{ if((e.account||'cash')===accId) rows.push({date:e.date, kind:'Expense', desc:e.desc, amount:-Number(e.amount), updatedAt:e.updatedAt}); });
   state.payouts.forEach(p=>{
     if((p.account||'cash')===accId){
       const name = p.recipientType==='investor' ? (state.investors.find(i=>i.id===p.recipientId)||{}).name
         : p.recipientType==='loan' ? (state.personalLoans.find(l=>l.id===p.recipientId)||{}).lender
         : (state.partners.find(x=>x.id===p.recipientId)||{}).name;
       const label = p.recipientType==='investor' ? 'Investor' : p.recipientType==='loan' ? 'Personal Loan' : 'Commission Agent';
-      rows.push({date:p.date, kind:'Payout ('+label+')', desc:name||'—', amount:-Number(p.amount)});
+      rows.push({date:p.date, kind:'Payout ('+label+')', desc:name||'—', amount:-Number(p.amount), updatedAt:p.updatedAt});
     }
   });
   state.transfers.forEach(t=>{
     const accName = (id)=> (allAccounts().find(a=>a.id===id)||{}).name || id;
-    if(t.fromAccount===accId) rows.push({date:t.date, kind:'Transfer Out', desc:'To '+accName(t.toAccount)+(t.note?' — '+t.note:''), amount:-Number(t.amount)});
-    if(t.toAccount===accId) rows.push({date:t.date, kind:'Transfer In', desc:'From '+accName(t.fromAccount)+(t.note?' — '+t.note:''), amount:Number(t.amount)});
+    if(t.fromAccount===accId) rows.push({date:t.date, kind:'Transfer Out', desc:'To '+accName(t.toAccount)+(t.note?' — '+t.note:''), amount:-Number(t.amount), updatedAt:t.updatedAt});
+    if(t.toAccount===accId) rows.push({date:t.date, kind:'Transfer In', desc:'From '+accName(t.fromAccount)+(t.note?' — '+t.note:''), amount:Number(t.amount), updatedAt:t.updatedAt});
   });
-  rows.sort((a,b)=> (a.date<b.date?-1:a.date>b.date?1:0));
+  rows.sort((a,b)=> a.date!==b.date ? (a.date<b.date?-1:1) : (a.updatedAt||'')<(b.updatedAt||'')?-1:(a.updatedAt||'')>(b.updatedAt||'')?1:0);
   const opening = accId==='cash' ? Number(state.settings.openingCash||0) : Number((state.banks.find(b=>b.id===accId)||{}).openingBalance||0);
   let running = opening;
   return rows.map(r=>{ running += r.amount; return {...r, balance:running}; });
@@ -1859,17 +1872,20 @@ function partyCombinedStatement(party){
   const bills = state.sales.filter(s=>s.party===party).map(s=>({
     date: s.date, type:'bill', amount: Number(s.total),
     desc: `${s.item} — ${fmtQtyPlain(s.qty)} ${s.unit||'kg'} @ Rs ${fmtPlain(s.rate)}`,
-    staged: !!s.staged, status: statusBySaleId.get(s.id) || (s.type==='cash'?'clear':'pending')
+    staged: !!s.staged, status: statusBySaleId.get(s.id) || (s.type==='cash'?'clear':'pending'),
+    updatedAt: s.updatedAt
   }));
   const receipts = state.receipts.filter(r=>r.party===party).map(r=>({
     date: r.date, type:'receipt', amount: Number(r.amount),
     desc: `Received into ${(allAccounts().find(a=>a.id===(r.account||'cash'))||{}).name||'Cash'}${r.note?' — '+r.note:''}`,
-    staged: !!r.staged, status: null
+    staged: !!r.staged, status: null, updatedAt: r.updatedAt
   }));
   const rows = [...bills, ...receipts].sort((a,b)=>{
     if(a.date<b.date) return -1;
     if(a.date>b.date) return 1;
-    return a.type===b.type ? 0 : (a.type==='bill' ? -1 : 1); // same day: bill is billed before it's paid
+    if(a.type!==b.type) return a.type==='bill' ? -1 : 1; // same day: bill is billed before it's paid
+    const au=a.updatedAt||'', bu=b.updatedAt||'';
+    return au<bu?-1:au>bu?1:0;
   });
   let balance = partyOpeningBalance(party);
   return rows.map(r=>{
@@ -3540,7 +3556,7 @@ function saleHistorySectionHtml(){
   const partyNames = Array.from(new Set(allSales.map(s=>s.party))).sort((a,b)=>a.localeCompare(b));
   const filterVal = historyPartyFilter;
   const filtered = filterVal==='__all__' ? allSales : allSales.filter(s=>s.party===filterVal);
-  const sorted = filtered.slice().sort((a,b)=> new Date(b.date) - new Date(a.date));
+  const sorted = filtered.slice().sort(byRecencyDesc);
   const rows = filterVal==='__all__' ? sorted.slice(0,10) : sorted;
   const saleCost = s => Number(s.total) - Number(s.profit||0);
   const profitPctRaw = s => Number(s.total)>0 ? (Number(s.profit||0)/Number(s.total)*100) : 0;
@@ -3675,7 +3691,7 @@ function renderSales(main){
       <table>
         <thead><tr><th>Date</th><th>Party</th><th>Variety</th><th>Qty</th><th>Rate</th><th>Total</th><th>Batch</th><th>Profit</th><th>Agent %</th><th>Status</th>${ro?'':'<th></th>'}</tr></thead>
         <tbody>
-          ${state.sales.slice().reverse().map(s=>{
+          ${state.sales.slice().sort(byRecencyDesc).map(s=>{
             const st = s.staged ? 'staged' : (s.type==='cash' ? 'cash' : creditSaleStatus(s));
             const statusHtml = st==='staged' ? '<span class="pill role" title="Entered during Historical Data Entry Mode — permanently excluded from Stock/Cash/Bank/Profit, counts only toward the Party Ledger and reminders">Historical</span>'
               : st==='cash' ? '<span class="pill cash">Cash</span>'
@@ -3725,7 +3741,7 @@ function renderSales(main){
       <table>
         <thead><tr><th>Date</th><th>Sale</th><th>Qty</th><th>Rate</th><th>Total</th><th>Settlement</th><th>Account</th><th>Note</th>${ro?'':'<th></th>'}</tr></thead>
         <tbody>
-          ${state.salesReturns.slice().reverse().map(r=>{
+          ${state.salesReturns.slice().sort(byRecencyDesc).map(r=>{
             const s = state.sales.find(x=>x.id===r.saleId);
             return `<tr><td>${fmtDate(r.date)}</td><td>${s?`${s.party} — ${s.item}`:'(sale removed)'}</td><td>${fmtQty(r.qty)} ${s?s.unit:''}</td><td>${fmtQty(r.rate)}</td><td>Rs ${fmt(r.total)}</td>
               <td>${r.settlement==='refund'?'<span class="pill cash">Refund</span>':'<span class="pill credit">Credit</span>'}</td>
@@ -4035,7 +4051,7 @@ function renderBuyerLedger(main, ro){
   const receivedTotal = partyReceiptsTotal(ledgerParty);
   const pending = partyPendingTotal(ledgerParty);
   const advance = partyAdvanceBalance(ledgerParty);
-  const partyReceipts = state.receipts.filter(r=>r.party===ledgerParty).slice().reverse();
+  const partyReceipts = state.receipts.filter(r=>r.party===ledgerParty).slice().sort(byRecencyDesc);
   main.innerHTML = `
     <section class="block">
       <h2>All Parties — Balances</h2>
@@ -4081,7 +4097,7 @@ function renderBuyerLedger(main, ro){
       <table>
         <thead><tr><th>Date</th><th>Item</th><th>Qty</th><th>Total</th><th>Returned</th><th>Received</th><th>Outstanding</th><th>Status</th><th>Due Date</th></tr></thead>
         <tbody>
-          ${rows.map(r=>{
+          ${rows.slice().sort((a,b)=>byRecencyDesc(a.sale,b.sale)).map(r=>{
             // QA Round 22, Item 5: Total stayed the original sale amount
             // even after a return, with no column explaining why Received
             // + Outstanding no longer add back up to it — add the missing
@@ -4240,7 +4256,7 @@ function renderSupplierLedger(main, ro){
     const p = state.purchases.find(x=>x.id===a.purchaseId);
     const purchaseNet = p ? Math.max(0, Number(p.total) - purchaseReturnsTotal(p.id)) : Number(a.amount);
     const appliedToPurchase = Math.min(Number(a.amount), purchaseNet);
-    return {kind:'advance', date:a.date, amount:appliedToPurchase, account:a.account, purchase:p};
+    return {kind:'advance', date:a.date, amount:appliedToPurchase, account:a.account, purchase:p, updatedAt:a.updatedAt};
   });
   // Round 20 Item 9: an advance bigger than its own purchase (supplierAdvanceExcessTotal)
   // feeds straight into the same pool Total Paid/Pending draw from, but had
@@ -4251,12 +4267,12 @@ function renderSupplierLedger(main, ro){
     const p = state.purchases.find(x=>x.id===a.purchaseId);
     const purchaseNet = p ? Math.max(0, Number(p.total) - purchaseReturnsTotal(p.id)) : Number(a.amount);
     const excess = Math.max(0, Number(a.amount) - purchaseNet);
-    return {kind:'advance-excess', date:a.date, amount:excess, account:a.account, purchase:p};
+    return {kind:'advance-excess', date:a.date, amount:excess, account:a.account, purchase:p, updatedAt:a.updatedAt};
   }).filter(r=>r.amount>0.009);
-  const supplierPaymentsList = state.supplierPayments.filter(p=>p.supplier===ledgerSupplier).map(p=>({kind:'payment', date:p.date, payment:p}))
+  const supplierPaymentsList = state.supplierPayments.filter(p=>p.supplier===ledgerSupplier).map(p=>({kind:'payment', date:p.date, payment:p, updatedAt:p.updatedAt}))
     .concat(advancePaymentRows)
     .concat(advanceExcessRows)
-    .sort((a,b)=> a.date<b.date?1:a.date>b.date?-1:0);
+    .sort(byRecencyDesc);
   main.innerHTML = `
     <section class="block">
       <h2>All Suppliers — Balances</h2>
@@ -4297,7 +4313,7 @@ function renderSupplierLedger(main, ro){
       <table>
         <thead><tr><th>Date</th><th>Item</th><th>Qty</th><th>Total</th><th>Paid</th><th>Outstanding</th><th>Status</th></tr></thead>
         <tbody>
-          ${rows.map(r=>{
+          ${rows.slice().sort((a,b)=>byRecencyDesc(a.purchase,b.purchase)).map(r=>{
             // Round 19 Bug 2: "Paid" previously only ever showed the pool-
             // applied portion (r.paid), so a purchase fully settled by its
             // OWN linked advance showed "Paid Rs 0 / Outstanding Rs <full
@@ -4433,7 +4449,7 @@ function renderPurchases(main){
       <table>
         <thead><tr><th>Date</th><th>Supplier</th><th>Variety</th><th>Qty</th><th>Rate</th><th>Total</th><th>Status</th>${ro?'':'<th></th>'}</tr></thead>
         <tbody>
-          ${state.purchases.slice().reverse().map(p=>`
+          ${state.purchases.slice().sort(byRecencyDesc).map(p=>`
             <tr>
               <td>${fmtDate(p.date)}</td><td>${p.supplier}</td><td>${p.item}</td><td>${fmtQty(p.qty)} ${p.unit||'kg'}</td><td>${fmtQty(p.rate)}</td><td>Rs ${fmt(p.total)}</td>
               <td>${p.staged ? '<span class="pill role" title="Entered during Historical Data Entry Mode — permanently excluded from Stock/Cash/Bank/Profit, counts only toward the Supplier Ledger">Historical</span>' : (p.type==='cash' ? '<span class="pill cash">Cash</span>' : (creditPurchaseStatus(p)==='clear'?'<span class="pill ok">Paid</span>':creditPurchaseStatus(p)==='partial'?'<span class="pill partial">Partially Paid</span>':'<span class="pill credit">Payable</span>'))}</td>
@@ -4478,7 +4494,7 @@ function renderPurchases(main){
       <table>
         <thead><tr><th>Date</th><th>Supplier</th><th>Amount</th><th>Account</th><th>Note</th><th>Status</th>${ro?'':'<th></th>'}</tr></thead>
         <tbody>
-          ${state.purchaseAdvances.slice().reverse().map(a=>`
+          ${state.purchaseAdvances.slice().sort(byRecencyDesc).map(a=>`
             <tr>
               <td>${fmtDate(a.date)}</td><td>${a.supplier}</td><td>Rs ${fmt(a.amount)}</td><td>${(allAccounts().find(x=>x.id===a.account)||{}).name||'Cash'}</td><td>${a.note||'—'}</td>
               <td>${a.status==='open'?'<span class="pill credit">Pending</span>':'<span class="pill ok">Completed</span>'}</td>
@@ -4514,7 +4530,7 @@ function renderPurchases(main){
       <table>
         <thead><tr><th>Date</th><th>Purchase</th><th>Qty</th><th>Rate</th><th>Total</th><th>Settlement</th><th>Account</th><th>Note</th>${ro?'':'<th></th>'}</tr></thead>
         <tbody>
-          ${state.purchaseReturns.slice().reverse().map(r=>{
+          ${state.purchaseReturns.slice().sort(byRecencyDesc).map(r=>{
             const p = state.purchases.find(x=>x.id===r.purchaseId);
             return `<tr><td>${fmtDate(r.date)}</td><td>${p?`${p.supplier} — ${p.item}`:'(purchase removed)'}</td><td>${fmtQty(r.qty)} ${p?p.unit:''}</td><td>${fmtQty(r.rate)}</td><td>Rs ${fmt(r.total)}</td>
               <td>${r.settlement==='refund'?'<span class="pill cash">Refund</span>':'<span class="pill credit">Credit</span>'}</td>
@@ -4918,7 +4934,7 @@ function wireChequeEntrySection(main){
 function paymentSectionHtml(ro){
   // previously capped at the latest 10 — with more pending than that, the
   // rest were unreachable from this screen (QA Round 14, minor item 7).
-  const pendingCheques = state.cheques.filter(c=>c.status==='pending').slice().reverse();
+  const pendingCheques = state.cheques.filter(c=>c.status==='pending').slice().sort(byRecencyDesc);
   return `
     ${ro? '' : `
     <section class="block">
@@ -5057,7 +5073,7 @@ function wirePaymentSection(main){
 }
 
 function transferSectionHtml(ro){
-  const transfers = state.transfers.slice().reverse();
+  const transfers = state.transfers.slice().sort(byRecencyDesc);
   return `
     ${ro? '' : `
     <section class="block">
@@ -5134,7 +5150,7 @@ function renderInvestors(main){
   const total = totalInvestment();
   const periodLabel = {day:'Today', week:'This Week', month:'This Month', all:'All Time'}[investorPeriod];
   const editing = editingInvestorId ? state.investors.find(x=>x.id===editingInvestorId) : null;
-  const investorPayouts = state.payouts.filter(p=>p.recipientType==='investor').slice().reverse();
+  const investorPayouts = state.payouts.filter(p=>p.recipientType==='investor').slice().sort(byRecencyDesc);
   main.innerHTML = `
     <div class="cards">
       <div class="card"><div class="label">Total Investment (all investors combined)</div><div class="value">Rs ${fmt(total)}</div></div>
@@ -5457,13 +5473,13 @@ function commissionLedgerHtml(){
       <table>
         <thead><tr><th>Date</th><th>Type</th><th>Party / Item</th><th>Amount</th><th>Balance</th>${ro?'':'<th></th>'}</tr></thead>
         <tbody>
-          <tr><td>—</td><td>Opening</td><td>—</td><td>—</td><td>Rs ${fmt(partner.openingProfit||0)}</td>${ro?'':'<td></td>'}</tr>
-          ${rows.map(r=>`
+          ${rows.slice().sort((a,b)=>byRecencyDesc(a.kind==='payout'?a.payout:a.sale, b.kind==='payout'?b.payout:b.sale)).map(r=>`
             <tr><td>${fmtDate(r.date)}</td><td>${r.kind==='payout'?'<span class="pill credit">Payment</span>':'<span class="pill ok">Commission</span>'}</td>
             <td>${r.kind==='payout'?(r.payout.note||'—'):(r.party+' — '+r.item)}</td>
             <td style="color:${r.amount<0?'var(--danger,#c0392b)':'inherit'};">${r.amount<0?'-':'+'}Rs ${fmt(Math.abs(r.amount))}</td>
             <td>Rs ${fmt(r.balance)}</td>
             ${ro?'':`<td class="row-actions">${r.kind==='payout'?`<button class="btn danger" data-editpayout="${r.payout.id}">Edit</button>${isAdmin()?`<button class="btn danger" data-delpayout="${r.payout.id}">Delete</button>`:''}`:''}</td>`}</tr>`).join('') || `<tr><td colspan="${ro?5:6}" class="empty">No commission or payments recorded yet</td></tr>`}
+          <tr><td>—</td><td>Opening</td><td>—</td><td>—</td><td>Rs ${fmt(partner.openingProfit||0)}</td>${ro?'':'<td></td>'}</tr>
         </tbody>
       </table>
       </div>
@@ -5473,7 +5489,7 @@ function commissionLedgerHtml(){
 // ---------- PARTNERS (profit-share taken before investor distribution) ----------
 function renderPartners(main){
   const ro = !canEditActiveClient();
-  const partnerPayouts = state.payouts.filter(p=>p.recipientType==='partner').slice().reverse();
+  const partnerPayouts = state.payouts.filter(p=>p.recipientType==='partner').slice().sort(byRecencyDesc);
   main.innerHTML = `
     ${ro? '' : `
     <section class="block">
@@ -5646,9 +5662,9 @@ function renderPartners(main){
 // Investment so it doesn't get mixed into equity/profit-share math) ----------
 function renderPersonalLoans(main){
   const ro = !canEditActiveClient();
-  const loanPayouts = state.payouts.filter(p=>p.recipientType==='loan').slice().reverse();
+  const loanPayouts = state.payouts.filter(p=>p.recipientType==='loan').slice().sort(byRecencyDesc);
   const totalOutstanding = totalPersonalLoansOutstanding();
-  const byDateAsc = (a,b)=> (a.date<b.date?-1:a.date>b.date?1:0);
+  const byDateAsc = (a,b)=> a.date!==b.date ? (a.date<b.date?-1:1) : (a.updatedAt||'')<(b.updatedAt||'')?-1:(a.updatedAt||'')>(b.updatedAt||'')?1:0;
   const activeLoans = state.personalLoans.filter(l=>personalLoanOutstanding(l)>0.009).slice().sort(byDateAsc);
   const paidOffLoans = state.personalLoans.filter(l=>personalLoanOutstanding(l)<=0.009).slice().sort(byDateAsc);
   const recentLoans = state.personalLoans.slice().sort(byDateAsc).slice(-10).reverse();
@@ -5895,7 +5911,7 @@ function renderExpenses(main){
       <table>
         <thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Paid From</th>${ro?'':'<th></th>'}</tr></thead>
         <tbody>
-          ${state.expenses.slice().reverse().map(e=>`<tr><td>${fmtDate(e.date)}</td><td>${e.desc}${e.excludeFromProfit?' <span class="pill role" title="Excluded from Trade Summary, Gross Profit and Net Worth Growth">One-time Adjustment</span>':''}</td><td>Rs ${fmt(e.amount)}</td><td>${(allAccounts().find(a=>a.id===(e.account||'cash'))||{}).name||'Cash'}</td>
+          ${state.expenses.slice().sort(byRecencyDesc).map(e=>`<tr><td>${fmtDate(e.date)}</td><td>${e.desc}${e.excludeFromProfit?' <span class="pill role" title="Excluded from Trade Summary, Gross Profit and Net Worth Growth">One-time Adjustment</span>':''}</td><td>Rs ${fmt(e.amount)}</td><td>${(allAccounts().find(a=>a.id===(e.account||'cash'))||{}).name||'Cash'}</td>
           ${ro?'':`<td class="row-actions"><button class="btn danger" data-eedit="${e.id}">Edit</button><button class="btn danger" data-edelete="${e.id}">Delete</button></td>`}</tr>`).join('') || `<tr><td colspan="5" class="empty">No expenses entered yet</td></tr>`}
         </tbody>
       </table>
@@ -5923,7 +5939,7 @@ function renderExpenses(main){
       <table>
         <thead><tr><th>Date</th><th>Description</th><th>Amount</th><th>Mode</th><th>Note</th>${ro?'':'<th></th>'}</tr></thead>
         <tbody>
-          ${state.miscIncome.slice().reverse().map(m=>`<tr><td>${fmtDate(m.date)}</td><td>${m.desc}${m.excludeFromProfit?' <span class="pill role" title="Excluded from Trade Summary, Gross Profit and Net Worth Growth">One-time Adjustment</span>':''}</td><td>Rs ${fmt(m.amount)}</td><td>${m.mode==='cash'?((allAccounts().find(a=>a.id===(m.account||'cash'))||{}).name||'Cash'):`Debit — ${m.supplier}`}</td><td>${m.note||'—'}</td>
+          ${state.miscIncome.slice().sort(byRecencyDesc).map(m=>`<tr><td>${fmtDate(m.date)}</td><td>${m.desc}${m.excludeFromProfit?' <span class="pill role" title="Excluded from Trade Summary, Gross Profit and Net Worth Growth">One-time Adjustment</span>':''}</td><td>Rs ${fmt(m.amount)}</td><td>${m.mode==='cash'?((allAccounts().find(a=>a.id===(m.account||'cash'))||{}).name||'Cash'):`Debit — ${m.supplier}`}</td><td>${m.note||'—'}</td>
           ${ro?'':`<td class="row-actions"><button class="btn danger" data-midelete="${m.id}">Delete</button></td>`}</tr>`).join('') || `<tr><td colspan="6" class="empty">No misc. income recorded yet</td></tr>`}
         </tbody>
       </table>
@@ -6169,7 +6185,7 @@ function renderReports(main){
         <table>
           <thead><tr><th>Date</th><th>Type</th><th>Description</th><th>Bill Amount</th><th>Amount Received</th><th>Balance</th><th>Status</th></tr></thead>
           <tbody>
-            ${rows.map(r=>`<tr><td>${fmtDate(r.date)}</td><td>${r.type==='bill'?'Bill':'Receipt'}${r.staged?' <span class="pill role" title="Historical entry">Historical</span>':''}</td><td>${r.desc}</td>
+            ${rows.slice().reverse().map(r=>`<tr><td>${fmtDate(r.date)}</td><td>${r.type==='bill'?'Bill':'Receipt'}${r.staged?' <span class="pill role" title="Historical entry">Historical</span>':''}</td><td>${r.desc}</td>
             <td>${r.type==='bill'?'Rs '+fmt(r.amount):'—'}</td><td>${r.type==='receipt'?'Rs '+fmt(r.amount):'—'}</td>
             <td>Rs ${fmt(r.balance)}</td><td>${r.type==='bill'?statusPill(r.status):'—'}</td></tr>`).join('') || `<tr><td colspan="7" class="empty">No bills or receipts for this party yet</td></tr>`}
           </tbody>
@@ -6220,7 +6236,7 @@ function renderReports(main){
         <table>
           <thead><tr><th>Date</th><th>Party</th><th>Amount</th><th>Received Into</th><th>Note</th></tr></thead>
           <tbody>
-            ${rows.map(r=>`<tr><td>${fmtDate(r.date)}</td><td>${r.party}</td><td>Rs ${fmt(r.amount)}</td><td>${r.method}</td><td>${r.note||'—'}</td></tr>`).join('') || `<tr><td colspan="5" class="empty">No receipts recorded this month</td></tr>`}
+            ${rows.slice().reverse().map(r=>`<tr><td>${fmtDate(r.date)}</td><td>${r.party}</td><td>Rs ${fmt(r.amount)}</td><td>${r.method}</td><td>${r.note||'—'}</td></tr>`).join('') || `<tr><td colspan="5" class="empty">No receipts recorded this month</td></tr>`}
           </tbody>
           ${rows.length ? `<tfoot><tr style="font-weight:700;background:var(--gold-soft);"><td colspan="2">Total</td><td>Rs ${fmt(grandTotal)}</td><td colspan="2"></td></tr></tfoot>` : ''}
         </table>
@@ -6233,7 +6249,7 @@ function renderReports(main){
         <table>
           <thead><tr><th>Date</th><th>Party</th><th>Amount</th><th>Received Into</th><th>Note</th></tr></thead>
           <tbody>
-            ${rows.map(r=>`<tr><td>${fmtDate(r.date)}</td><td>${r.party}</td><td>Rs ${fmt(r.amount)}</td><td>${r.method}</td><td>${r.note||'—'}</td></tr>`).join('') || `<tr><td colspan="5" class="empty">No receipts recorded yet</td></tr>`}
+            ${rows.slice().reverse().map(r=>`<tr><td>${fmtDate(r.date)}</td><td>${r.party}</td><td>Rs ${fmt(r.amount)}</td><td>${r.method}</td><td>${r.note||'—'}</td></tr>`).join('') || `<tr><td colspan="5" class="empty">No receipts recorded yet</td></tr>`}
           </tbody>
           ${rows.length ? `<tfoot><tr style="font-weight:700;background:var(--gold-soft);"><td colspan="2">Total</td><td>Rs ${fmt(grandTotal)}</td><td colspan="2"></td></tr></tfoot>` : ''}
         </table>
@@ -6291,7 +6307,7 @@ function renderReports(main){
       <table>
         <thead><tr><th>Date</th><th>Direction</th><th>Party</th><th>Bank</th><th>Amount</th><th>Due Date</th><th>Status</th></tr></thead>
         <tbody>
-          ${state.cheques.slice().reverse().map(c=>`<tr><td>${fmtDate(c.date)}</td><td>${c.direction==='issued'?'Issued':'Received'}</td><td>${c.party}</td><td>${c.bank||'—'}</td><td>Rs ${fmt(c.amount)}</td><td>${fmtDate(c.dueDate)}</td><td>${c.status==='pending'?'<span class="pill due">Pending</span>':'<span class="pill ok">Cleared</span>'}</td></tr>`).join('') || '<tr><td colspan="7" class="empty">No cheques entered yet</td></tr>'}
+          ${state.cheques.slice().sort(byRecencyDesc).map(c=>`<tr><td>${fmtDate(c.date)}</td><td>${c.direction==='issued'?'Issued':'Received'}</td><td>${c.party}</td><td>${c.bank||'—'}</td><td>Rs ${fmt(c.amount)}</td><td>${fmtDate(c.dueDate)}</td><td>${c.status==='pending'?'<span class="pill due">Pending</span>':'<span class="pill ok">Cleared</span>'}</td></tr>`).join('') || '<tr><td colspan="7" class="empty">No cheques entered yet</td></tr>'}
         </tbody>
       </table>
       </div>

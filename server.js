@@ -810,6 +810,29 @@ async function ensureSchema() {
     CREATE UNIQUE INDEX IF NOT EXISTS parties_client_name_ci_idx ON parties (client_id, LOWER(TRIM(name)));
     CREATE UNIQUE INDEX IF NOT EXISTS suppliers_client_name_ci_idx ON suppliers (client_id, LOWER(TRIM(name)));
     CREATE UNIQUE INDEX IF NOT EXISTS stock_client_name_unit_ci_idx ON stock (client_id, LOWER(TRIM(name)), unit);
+    -- The "Date" field is the business/transaction date, which several
+    -- records can legitimately share (two receipts on the same day) — the
+    -- app had no way to say which of a same-date group was actually entered
+    -- or edited more recently, so their relative display order was whatever
+    -- Postgres happened to return (not guaranteed stable). updated_at
+    -- defaults to the moment a row is created and every PATCH endpoint below
+    -- bumps it to now() — used ONLY as a same-date display tiebreaker
+    -- (newest-touched on top), never as a FIFO/allocation ordering key, so
+    -- editing an old record can't silently reshuffle which invoice is
+    -- "Pending" vs "Partially Received" for anyone.
+    ALTER TABLE sales ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    ALTER TABLE purchases ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    ALTER TABLE cheques ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    ALTER TABLE expenses ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    ALTER TABLE receipts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    ALTER TABLE payouts ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    ALTER TABLE transfers ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    ALTER TABLE personal_loans ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    ALTER TABLE purchase_returns ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    ALTER TABLE sales_returns ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    ALTER TABLE purchase_advances ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+    ALTER TABLE misc_income ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
   `);
 }
 
@@ -818,37 +841,39 @@ const mapSale = (r) => ({
   id: r.id, date: r.date, party: r.party, item: r.item, qty: r.qty, unit: r.unit, rate: r.rate,
   total: r.total, type: r.type, account: r.account_id, paid: r.paid, dueDate: r.due_date,
   creditDays: r.credit_days, profit: r.profit, partnerId: r.partner_id, partnerPercent: r.partner_percent,
-  staged: r.staged, sourcePurchaseId: r.source_purchase_id
+  staged: r.staged, sourcePurchaseId: r.source_purchase_id, updatedAt: r.updated_at
 });
 const mapPurchase = (r) => ({
   id: r.id, date: r.date, supplier: r.supplier, item: r.item, qty: r.qty, unit: r.unit,
   rate: r.rate, total: r.total, type: r.type, account: r.account_id, paid: r.paid, staged: r.staged,
   paidAmount: r.paid_amount,
-  fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids)
+  fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids),
+  updatedAt: r.updated_at
 });
-const mapPurchaseReturn = (r) => ({ id: r.id, date: r.date, purchaseId: r.purchase_id, qty: r.qty, rate: r.rate, total: r.total, settlement: r.settlement, account: r.account_id, note: r.note });
+const mapPurchaseReturn = (r) => ({ id: r.id, date: r.date, purchaseId: r.purchase_id, qty: r.qty, rate: r.rate, total: r.total, settlement: r.settlement, account: r.account_id, note: r.note, updatedAt: r.updated_at });
 const mapPurchaseAdvance = (r) => ({
   id: r.id, date: r.date, supplier: r.supplier, amount: r.amount, account: r.account_id, note: r.note,
   status: r.status, purchaseId: r.purchase_id,
-  fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids)
+  fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids),
+  updatedAt: r.updated_at
 });
-const mapSaleReturn = (r) => ({ id: r.id, date: r.date, saleId: r.sale_id, qty: r.qty, rate: r.rate, total: r.total, settlement: r.settlement, account: r.account_id, note: r.note });
-const mapCheque = (r) => ({ id: r.id, date: r.date, party: r.party, bank: r.bank, amount: r.amount, dueDate: r.due_date, account: r.account_id, status: r.status, receiptId: r.receipt_id, direction: r.direction, paymentId: r.payment_id });
+const mapSaleReturn = (r) => ({ id: r.id, date: r.date, saleId: r.sale_id, qty: r.qty, rate: r.rate, total: r.total, settlement: r.settlement, account: r.account_id, note: r.note, updatedAt: r.updated_at });
+const mapCheque = (r) => ({ id: r.id, date: r.date, party: r.party, bank: r.bank, amount: r.amount, dueDate: r.due_date, account: r.account_id, status: r.status, receiptId: r.receipt_id, direction: r.direction, paymentId: r.payment_id, updatedAt: r.updated_at });
 const mapInvestor = (r) => ({ id: r.id, name: r.name, amount: r.amount, ratio: r.ratio, account: r.account_id, staged: r.staged, date: r.date });
 const mapPartner = (r) => ({ id: r.id, name: r.name, openingProfit: r.opening_profit });
 const mapParty = (r) => ({ id: r.id, name: r.name, openingBalance: r.opening_balance, dueDate: r.due_date });
 const mapSupplier = (r) => ({ id: r.id, name: r.name, openingBalance: r.opening_balance, dueDate: r.due_date });
-const mapExpense = (r) => ({ id: r.id, date: r.date, desc: r.description, amount: r.amount, account: r.account_id, fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids), excludeFromProfit: r.exclude_from_profit });
-const mapMiscIncome = (r) => ({ id: r.id, date: r.date, desc: r.description, amount: r.amount, mode: r.mode, account: r.account_id, supplier: r.supplier, note: r.note, excludeFromProfit: r.exclude_from_profit });
+const mapExpense = (r) => ({ id: r.id, date: r.date, desc: r.description, amount: r.amount, account: r.account_id, fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids), excludeFromProfit: r.exclude_from_profit, updatedAt: r.updated_at });
+const mapMiscIncome = (r) => ({ id: r.id, date: r.date, desc: r.description, amount: r.amount, mode: r.mode, account: r.account_id, supplier: r.supplier, note: r.note, excludeFromProfit: r.exclude_from_profit, updatedAt: r.updated_at });
 const mapBank = (r) => ({ id: r.id, name: r.name, openingBalance: r.opening_balance, locker: r.is_locker });
 const mapStock = (r) => ({ id: r.id, name: r.name, qty: r.qty, unit: r.unit, rate: r.rate, avgCost: r.avg_cost, openingQty: r.opening_qty, openingRate: r.opening_rate });
-const mapReceipt = (r) => ({ id: r.id, date: r.date, party: r.party, amount: r.amount, account: r.account_id, note: r.note, staged: r.staged });
-const mapSupplierPayment = (r) => ({ id: r.id, date: r.date, supplier: r.supplier, amount: r.amount, account: r.account_id, note: r.note, staged: r.staged, fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids) });
-const mapTransfer = (r) => ({ id: r.id, date: r.date, fromAccount: r.from_account, toAccount: r.to_account, amount: r.amount, note: r.note, fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids) });
-const mapPersonalLoan = (r) => ({ id: r.id, date: r.date, lender: r.lender, amount: r.amount, account: r.account_id, note: r.note });
+const mapReceipt = (r) => ({ id: r.id, date: r.date, party: r.party, amount: r.amount, account: r.account_id, note: r.note, staged: r.staged, updatedAt: r.updated_at });
+const mapSupplierPayment = (r) => ({ id: r.id, date: r.date, supplier: r.supplier, amount: r.amount, account: r.account_id, note: r.note, staged: r.staged, fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids), updatedAt: r.updated_at });
+const mapTransfer = (r) => ({ id: r.id, date: r.date, fromAccount: r.from_account, toAccount: r.to_account, amount: r.amount, note: r.note, fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids), updatedAt: r.updated_at });
+const mapPersonalLoan = (r) => ({ id: r.id, date: r.date, lender: r.lender, amount: r.amount, account: r.account_id, note: r.note, updatedAt: r.updated_at });
 const mapTradeSummary = (r) => ({ id: r.id, date: r.date, period: r.period, periodLabel: r.period_label, sales: r.sales, purchases: r.purchases, commissionNew: r.commission_new, commissionOpening: r.commission_opening, expenses: r.expenses, profit: r.profit, createdAt: r.created_at });
 const mapInvestorSummary = (r) => ({ id: r.id, investorId: r.investor_id, investorName: r.investor_name, date: r.date, period: r.period, periodLabel: r.period_label, investment: r.investment, profitShare: r.profit_share, expenseShare: r.expense_share, expenseShareMonth: r.expense_share_month, expenseShareAll: r.expense_share_all, paidOut: r.paid_out, netOwed: r.net_owed, rows: r.rows, createdAt: r.created_at });
-const mapPayout = (r) => ({ id: r.id, date: r.date, recipientType: r.recipient_type, recipientId: r.recipient_id, amount: r.amount, account: r.account_id, note: r.note, fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids) });
+const mapPayout = (r) => ({ id: r.id, date: r.date, recipientType: r.recipient_type, recipientId: r.recipient_id, amount: r.amount, account: r.account_id, note: r.note, fundingTransferIds: parseIdList(r.funding_transfer_ids), fundingLoanIds: parseIdList(r.funding_loan_ids), updatedAt: r.updated_at });
 const mapAudit = (r) => ({ id: r.id, kind: r.kind, action: r.action, actionDate: r.action_date, before: r.before, after: r.after, entry: r.entry });
 
 // ---------- server-side stock + audit helpers (used by the per-entity routes below) ----------
@@ -1592,21 +1617,21 @@ app.get('/api/state', requireAuth, resolveActiveClient, requireClientAccess('vie
         db.query('SELECT * FROM stock WHERE client_id = $1 ORDER BY name', [cid]),
         db.query('SELECT * FROM sales WHERE client_id = $1 ORDER BY date, id', [cid]),
         db.query('SELECT * FROM purchases WHERE client_id = $1 ORDER BY date, id', [cid]),
-        db.query('SELECT * FROM cheques WHERE client_id = $1 ORDER BY date', [cid]),
+        db.query('SELECT * FROM cheques WHERE client_id = $1 ORDER BY date, updated_at', [cid]),
         db.query('SELECT * FROM investors WHERE client_id = $1 ORDER BY name', [cid]),
-        db.query('SELECT * FROM expenses WHERE client_id = $1 ORDER BY date', [cid]),
-        db.query('SELECT * FROM receipts WHERE client_id = $1 ORDER BY date', [cid]),
-        db.query('SELECT * FROM payouts WHERE client_id = $1 ORDER BY date', [cid]),
+        db.query('SELECT * FROM expenses WHERE client_id = $1 ORDER BY date, updated_at', [cid]),
+        db.query('SELECT * FROM receipts WHERE client_id = $1 ORDER BY date, updated_at', [cid]),
+        db.query('SELECT * FROM payouts WHERE client_id = $1 ORDER BY date, updated_at', [cid]),
         db.query('SELECT * FROM audit_log WHERE client_id = $1 ORDER BY action_date', [cid]),
-        db.query('SELECT * FROM supplier_payments WHERE client_id = $1 ORDER BY date', [cid]),
-        db.query('SELECT * FROM transfers WHERE client_id = $1 ORDER BY date', [cid]),
-        db.query('SELECT * FROM personal_loans WHERE client_id = $1 ORDER BY date', [cid]),
+        db.query('SELECT * FROM supplier_payments WHERE client_id = $1 ORDER BY date, updated_at', [cid]),
+        db.query('SELECT * FROM transfers WHERE client_id = $1 ORDER BY date, updated_at', [cid]),
+        db.query('SELECT * FROM personal_loans WHERE client_id = $1 ORDER BY date, updated_at', [cid]),
         db.query('SELECT * FROM trade_summaries WHERE client_id = $1 ORDER BY created_at DESC', [cid]),
         db.query('SELECT * FROM investor_summaries WHERE client_id = $1 ORDER BY created_at DESC', [cid]),
-        db.query('SELECT * FROM purchase_returns WHERE client_id = $1 ORDER BY date', [cid]),
-        db.query('SELECT * FROM sales_returns WHERE client_id = $1 ORDER BY date', [cid]),
-        db.query('SELECT * FROM purchase_advances WHERE client_id = $1 ORDER BY date', [cid]),
-        db.query('SELECT * FROM misc_income WHERE client_id = $1 ORDER BY date', [cid])
+        db.query('SELECT * FROM purchase_returns WHERE client_id = $1 ORDER BY date, updated_at', [cid]),
+        db.query('SELECT * FROM sales_returns WHERE client_id = $1 ORDER BY date, updated_at', [cid]),
+        db.query('SELECT * FROM purchase_advances WHERE client_id = $1 ORDER BY date, updated_at', [cid]),
+        db.query('SELECT * FROM misc_income WHERE client_id = $1 ORDER BY date, updated_at', [cid])
       ]);
       return { settings: settings.rows[0], banks, partners, parties, suppliers, stock, sales, purchases, cheques, investors, expenses, receipts, payouts, auditLog, supplierPayments, transfers, personalLoans, tradeSummaries, investorSummaries, purchaseReturns, salesReturns, purchaseAdvances, miscIncome };
     });
@@ -1875,7 +1900,7 @@ app.patch('/api/sales/:id', ...editorAccess, async (req, res) => {
       }
       const r = await db.query(
         `UPDATE sales SET date=$1,party=$2,item=$3,qty=$4,unit=$5,rate=$6,total=$7,type=$8,account_id=$9,
-           due_date=$10,credit_days=$11,profit=$12,partner_id=$13,partner_percent=$14,source_purchase_id=$17
+           due_date=$10,credit_days=$11,profit=$12,partner_id=$13,partner_percent=$14,source_purchase_id=$17,updated_at=now()
          WHERE id=$15 AND client_id=$16 RETURNING *`,
         [x.date, x.party, x.item, Number(x.qty), x.unit || 'kg', Number(x.rate), total, x.type, x.account || 'cash',
           x.type === 'credit' ? x.dueDate || null : null, x.type === 'credit' ? x.creditDays || null : null,
@@ -2137,7 +2162,7 @@ app.patch('/api/purchases/:id', ...editorAccess, async (req, res) => {
       }
       const total = Number(x.qty) * Number(x.rate);
       const r = await db.query(
-        `UPDATE purchases SET date=$1,supplier=$2,item=$3,qty=$4,unit=$5,rate=$6,total=$7,type=$8,account_id=$9
+        `UPDATE purchases SET date=$1,supplier=$2,item=$3,qty=$4,unit=$5,rate=$6,total=$7,type=$8,account_id=$9,updated_at=now()
          WHERE id=$10 AND client_id=$11 RETURNING *`,
         [x.date, x.supplier, x.item, Number(x.qty), unit, Number(x.rate), total, x.type, x.account || 'cash', req.params.id, req.clientId]
       );
@@ -2505,7 +2530,7 @@ app.patch('/api/cheques/:id', ...editorAccess, async (req, res) => {
         throw e;
       }
       const r = await db.query(
-        'UPDATE cheques SET date=$1, party=$2, bank=$3, amount=$4, due_date=$5, account_id=$6, direction=$7 WHERE id=$8 AND client_id=$9 RETURNING *',
+        'UPDATE cheques SET date=$1, party=$2, bank=$3, amount=$4, due_date=$5, account_id=$6, direction=$7, updated_at=now() WHERE id=$8 AND client_id=$9 RETURNING *',
         [x.date, x.party, x.bank || null, Number(x.amount), x.dueDate, x.account || 'cash', direction, req.params.id, req.clientId]
       );
       await writeAudit(db, req.clientId, 'cheque', 'edit', {
@@ -3133,7 +3158,7 @@ app.patch('/api/expenses/:id', ...editorAccess, async (req, res) => {
       const old = before.rows[0];
       const newAccount = x.account || 'cash';
       const newExcludeFromProfit = x.excludeFromProfit !== undefined ? !!x.excludeFromProfit : old.exclude_from_profit;
-      const r = await db.query('UPDATE expenses SET date=$1, description=$2, amount=$3, account_id=$4, exclude_from_profit=$5 WHERE id=$6 AND client_id=$7 RETURNING *',
+      const r = await db.query('UPDATE expenses SET date=$1, description=$2, amount=$3, account_id=$4, exclude_from_profit=$5, updated_at=now() WHERE id=$6 AND client_id=$7 RETURNING *',
         [x.date, x.desc, Number(x.amount), newAccount, newExcludeFromProfit, req.params.id, req.clientId]);
       // QA: no overdraft guard existed on this edit path at all.
       const bal = await computeAccountBalanceDb(db, req.clientId, newAccount);
@@ -3273,7 +3298,7 @@ app.patch('/api/receipts/:id', ...editorAccess, async (req, res) => {
       // staged (Historical) is set once at creation and never changed by an
       // edit — same rule as every other entry type in the app.
       const r = await db.query(
-        'UPDATE receipts SET date=$1, party=$2, amount=$3, account_id=$4, note=$5 WHERE id=$6 AND client_id=$7 RETURNING *',
+        'UPDATE receipts SET date=$1, party=$2, amount=$3, account_id=$4, note=$5, updated_at=now() WHERE id=$6 AND client_id=$7 RETURNING *',
         [x.date, x.party, Number(x.amount), x.account || 'cash', x.note || null, req.params.id, req.clientId]
       );
       // QA Round 15, Bug 1: editing had no server-side guard at all. Check
@@ -3369,7 +3394,7 @@ app.patch('/api/payouts/:id', ...editorAccess, async (req, res) => {
       const newFundingTransferIds = x.fundingTransferIds !== undefined ? fundingIdsJson(x.fundingTransferIds) : old.funding_transfer_ids;
       const newFundingLoanIds = x.fundingLoanIds !== undefined ? fundingIdsJson(x.fundingLoanIds) : old.funding_loan_ids;
       const r = await db.query(
-        'UPDATE payouts SET date=$1, recipient_id=$2, amount=$3, account_id=$4, note=$5, funding_transfer_ids=$6, funding_loan_ids=$7 WHERE id=$8 AND client_id=$9 RETURNING *',
+        'UPDATE payouts SET date=$1, recipient_id=$2, amount=$3, account_id=$4, note=$5, funding_transfer_ids=$6, funding_loan_ids=$7, updated_at=now() WHERE id=$8 AND client_id=$9 RETURNING *',
         [x.date, x.recipientId, Number(x.amount), newAccount, x.note || null, newFundingTransferIds, newFundingLoanIds, req.params.id, req.clientId]
       );
       // QA: no overdraft guard existed on this edit path at all.
@@ -3458,7 +3483,7 @@ app.patch('/api/supplier-payments/:id', ...editorAccess, async (req, res) => {
       if (!before.rows[0]) return null;
       const old = before.rows[0];
       const r = await db.query(
-        'UPDATE supplier_payments SET date=$1, supplier=$2, amount=$3, account_id=$4, note=$5 WHERE id=$6 AND client_id=$7 RETURNING *',
+        'UPDATE supplier_payments SET date=$1, supplier=$2, amount=$3, account_id=$4, note=$5, updated_at=now() WHERE id=$6 AND client_id=$7 RETURNING *',
         [x.date, x.supplier, Number(x.amount), x.account || 'cash', x.note || null, req.params.id, req.clientId]
       );
       // QA Round 15, Bug 1: same guard as receipts — check the account's
