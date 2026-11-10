@@ -543,6 +543,7 @@ async function ensureSchema() {
     ALTER TABLE settings ALTER COLUMN hide_other_cards SET DEFAULT TRUE;
     ALTER TABLE settings ALTER COLUMN hide_total_investment SET DEFAULT TRUE;
     ALTER TABLE settings ALTER COLUMN hide_trade_summary SET DEFAULT TRUE;
+    ALTER TABLE settings ADD COLUMN IF NOT EXISTS show_cheque_collect_reminder BOOLEAN NOT NULL DEFAULT TRUE;
     CREATE TABLE IF NOT EXISTS bank_accounts (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, opening_balance NUMERIC(14,2) NOT NULL DEFAULT 0
     );
@@ -1648,8 +1649,9 @@ app.get('/api/state', requireAuth, resolveActiveClient, requireClientAccess('vie
         fontSize: s.font_size,
         hideOtherCards: s.hide_other_cards,
         hideTotalInvestment: s.hide_total_investment,
-        hideTradeSummary: s.hide_trade_summary
-      } : { companyName: '', businessLabel: '', openingCash: 0, chequeReminderDays: 3, creditReminderDays: 3, setupMode: false, themeColor: '#2563EB', fontSize: 'medium', hideOtherCards: true, hideTotalInvestment: true, hideTradeSummary: true },
+        hideTradeSummary: s.hide_trade_summary,
+        showChequeCollectReminder: s.show_cheque_collect_reminder
+      } : { companyName: '', businessLabel: '', openingCash: 0, chequeReminderDays: 3, creditReminderDays: 3, setupMode: false, themeColor: '#2563EB', fontSize: 'medium', hideOtherCards: true, hideTotalInvestment: true, hideTradeSummary: true, showChequeCollectReminder: true },
       banks: data.banks.rows.map(mapBank),
       partners: data.partners.rows.map(mapPartner),
       parties: data.parties.rows.map(mapParty),
@@ -3747,18 +3749,19 @@ app.patch('/api/settings', ...editorAccess, async (req, res) => {
     // supplier ledger, receivable/payable totals and reminders, nothing else.
     const row = await withTenantDb(req.clientId, (db) =>
       db.query(
-        `INSERT INTO settings (client_id, company_name, business_label, opening_cash, cheque_reminder_days, credit_reminder_days, setup_mode, theme_color, font_size, hide_other_cards, hide_total_investment, hide_trade_summary)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-         ON CONFLICT (client_id) DO UPDATE SET company_name=$2, business_label=$3, opening_cash=$4, cheque_reminder_days=$5, credit_reminder_days=$6, setup_mode=$7, theme_color=$8, font_size=$9, hide_other_cards=$10, hide_total_investment=$11, hide_trade_summary=$12
+        `INSERT INTO settings (client_id, company_name, business_label, opening_cash, cheque_reminder_days, credit_reminder_days, setup_mode, theme_color, font_size, hide_other_cards, hide_total_investment, hide_trade_summary, show_cheque_collect_reminder)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+         ON CONFLICT (client_id) DO UPDATE SET company_name=$2, business_label=$3, opening_cash=$4, cheque_reminder_days=$5, credit_reminder_days=$6, setup_mode=$7, theme_color=$8, font_size=$9, hide_other_cards=$10, hide_total_investment=$11, hide_trade_summary=$12, show_cheque_collect_reminder=$13
          RETURNING *`,
-        [req.clientId, x.companyName || '', x.businessLabel || '', Number(x.openingCash) || 0, Number(x.chequeReminderDays) || 0, Number(x.creditReminderDays) || 0, !!x.setupMode, themeColor, fontSize, !!x.hideOtherCards, !!x.hideTotalInvestment, !!x.hideTradeSummary]
+        [req.clientId, x.companyName || '', x.businessLabel || '', Number(x.openingCash) || 0, Number(x.chequeReminderDays) || 0, Number(x.creditReminderDays) || 0, !!x.setupMode, themeColor, fontSize, !!x.hideOtherCards, !!x.hideTotalInvestment, !!x.hideTradeSummary, x.showChequeCollectReminder !== false]
       ).then((r) => r.rows[0])
     );
     res.json({
       companyName: row.company_name, businessLabel: row.business_label, openingCash: row.opening_cash,
       chequeReminderDays: row.cheque_reminder_days, creditReminderDays: row.credit_reminder_days, setupMode: row.setup_mode,
       themeColor: row.theme_color, fontSize: row.font_size,
-      hideOtherCards: row.hide_other_cards, hideTotalInvestment: row.hide_total_investment, hideTradeSummary: row.hide_trade_summary
+      hideOtherCards: row.hide_other_cards, hideTotalInvestment: row.hide_total_investment, hideTradeSummary: row.hide_trade_summary,
+      showChequeCollectReminder: row.show_cheque_collect_reminder
     });
   } catch (err) {
     console.error('PATCH /api/settings error:', err);

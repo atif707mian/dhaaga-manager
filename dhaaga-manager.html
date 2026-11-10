@@ -240,7 +240,7 @@
 
 <script>
 let state = {
-  settings: { companyName: '', businessLabel: '', openingCash: 0, chequeReminderDays: 3, creditReminderDays: 3, setupMode: false, themeColor: '#2563EB', fontSize: 'medium', hideOtherCards: true, hideTotalInvestment: true, hideTradeSummary: true },
+  settings: { companyName: '', businessLabel: '', openingCash: 0, chequeReminderDays: 3, creditReminderDays: 3, setupMode: false, themeColor: '#2563EB', fontSize: 'medium', hideOtherCards: true, hideTotalInvestment: true, hideTradeSummary: true, showChequeCollectReminder: true },
   stock: [],
   sales: [],
   purchases: [],
@@ -1943,7 +1943,7 @@ function partyColor(name){
 }
 function reminderAlerts(){
   const alerts = [];
-  state.cheques.filter(c=>c.status==='pending').forEach(c=>{
+  state.cheques.filter(c=>c.status==='pending' && (c.direction==='issued' || state.settings.showChequeCollectReminder!==false)).forEach(c=>{
     const d = daysUntil(c.dueDate);
     if(d <= state.settings.chequeReminderDays){
       const label = c.direction==='issued' ? 'Cheque to Pay' : 'Cheque to Collect';
@@ -2807,6 +2807,86 @@ function drawPartyLedgerCanvas(party){
 }
 function downloadPartyLedgerImage(party, dir){
   return downloadCanvasAsJpg(drawPartyLedgerCanvas(party), `${party.replace(/[^a-z0-9]+/gi,'-')}-${todayStr()}_${fsTimeSuffix()}.jpg`, dir);
+}
+function drawPartyReceiptsCanvas(party){
+  const rows = applySortDir(state.receipts.filter(r=>r.party===party).slice().sort(byRecencyDesc),'partyReceiptsHistory');
+
+  const W = 960;
+  const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
+  const ROW_H = 32;
+  const TOP = 40+28+34 /*title + as-of*/ + 34 /*table head*/;
+  const bodyRows = Math.max(1, rows.length);
+  const H = TOP + bodyRows*ROW_H + 24;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0,0,W,H);
+  ctx.textBaseline = 'alphabetic';
+
+  let y = 40;
+  ctx.fillStyle = '#111111';
+  ctx.font = `bold 22px ${FONT}`;
+  ctx.textAlign = 'left';
+  ctx.fillText(`${party} — Receipts History`, 32, y);
+  y += 28;
+  ctx.font = `13px ${FONT}`;
+  ctx.fillStyle = '#888888';
+  ctx.fillText(`As of: ${fmtDate(todayStr())}`, 32, y);
+  y += 34;
+
+  const cols = [
+    {key:'date', label:'Date', w:100},
+    {key:'amount', label:'Amount', w:120},
+    {key:'into', label:'Received Into', w:180},
+    {key:'note', label:'Note', w:W-64-100-120-180}
+  ];
+  const colX = [];
+  { let cx = 32; cols.forEach(c=>{ colX.push(cx); cx += c.w; }); }
+
+  ctx.font = `600 11px ${FONT}`;
+  ctx.fillStyle = '#888888';
+  ctx.textAlign = 'left';
+  cols.forEach((c,i)=> ctx.fillText(c.label.toUpperCase(), colX[i], y));
+  y += 10;
+  ctx.strokeStyle = '#e4e4e4';
+  ctx.beginPath(); ctx.moveTo(32,y); ctx.lineTo(W-32,y); ctx.stroke();
+  y += 24;
+
+  function truncate(text, maxWidth, font){
+    ctx.font = font;
+    const s = String(text);
+    if(ctx.measureText(s).width <= maxWidth) return s;
+    let t = s;
+    while(t.length>1 && ctx.measureText(t+'…').width > maxWidth) t = t.slice(0,-1);
+    return t + '…';
+  }
+
+  if(!rows.length){
+    ctx.font = `14px ${FONT}`;
+    ctx.fillStyle = '#888888';
+    ctx.fillText('No receipts recorded yet', 32, y);
+    y += ROW_H;
+  } else {
+    rows.forEach(r=>{
+      const into = r.staged ? 'Historical' : ((allAccounts().find(a=>a.id===(r.account||'cash'))||{}).name||'Cash');
+      const baseFont = `13px ${FONT}`;
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#111111';
+      ctx.font = baseFont;
+      ctx.fillText(fmtDate(r.date), colX[0], y);
+      ctx.fillText('Rs ' + fmtPlain(r.amount), colX[1], y);
+      ctx.fillText(truncate(into, cols[2].w-8, baseFont), colX[2], y);
+      ctx.fillText(truncate(r.note||'—', cols[3].w-8, baseFont), colX[3], y);
+      y += ROW_H;
+    });
+  }
+
+  return canvas;
+}
+function downloadPartyReceiptsImage(party, dir){
+  return downloadCanvasAsJpg(drawPartyReceiptsCanvas(party), `${party.replace(/[^a-z0-9]+/gi,'-')}-Receipts-${todayStr()}_${fsTimeSuffix()}.jpg`, dir);
 }
 // generic "download any canvas as JPG" — shared by Trade Summary and
 // Investor Summary saves. Where the browser supports it (the File System
@@ -4142,6 +4222,10 @@ function renderBuyerLedger(main, ro){
     </section>
     <section class="block">
       <h2>${ledgerParty} — Receipts History</h2>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+        <button class="btn gold" id="plr_save">Download Receipts as JPG</button>
+        <button class="btn danger" id="plr_change_location">Change Save Location</button>
+      </div>
       ${sortToggleHtml('partyReceiptsHistory')}
       <div style="overflow-x:auto;">
       <table>
@@ -4175,6 +4259,20 @@ function renderBuyerLedger(main, ro){
       }catch(e){ await showAlert(e.message||'Could not save the ledger'); }
     };
     main.querySelector('#pl_change_location').onclick = async()=>{
+      if(!fsApiSupported()){ await showAlert("Your browser doesn't support choosing a save folder. Use Chrome or Edge for this, or just use your browser's normal Downloads folder."); return; }
+      const dir = await fsResolveSaveDir(true);
+      if(dir){ showToast(`Save location updated to "${dir.name}" — future downloads will go there`); render(); }
+    };
+  }
+  if(main.querySelector('#plr_save')){
+    main.querySelector('#plr_save').onclick = async()=>{
+      const dir = await fsResolveSaveDir(false);
+      try{
+        await downloadPartyReceiptsImage(ledgerParty, dir);
+        showToast(dir ? `Receipts history saved to folder "${dir.name}"` : 'Receipts history saved and downloaded');
+      }catch(e){ await showAlert(e.message||'Could not save the receipts history'); }
+    };
+    main.querySelector('#plr_change_location').onclick = async()=>{
       if(!fsApiSupported()){ await showAlert("Your browser doesn't support choosing a save folder. Use Chrome or Edge for this, or just use your browser's normal Downloads folder."); return; }
       const dir = await fsResolveSaveDir(true);
       if(dir){ showToast(`Save location updated to "${dir.name}" — future downloads will go there`); render(); }
@@ -5254,7 +5352,7 @@ function renderInvestors(main){
         <div class="settings-note" style="margin-bottom:8px;">Last saved summary — older saves stay stored but aren't listed here.</div>
         <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px;">
           <div><b>${r.investorName}</b> — ${r.period==='month'?'Month — '+r.periodLabel:'All Time'} <span style="color:var(--muted);font-size:12px;">(saved ${fmtDate(r.date)})</span></div>
-          ${ro?'':`<button class="btn danger" data-delis="${r.id}">Delete</button>`}
+          <div style="display:flex;gap:8px;flex-wrap:wrap;"><button class="btn gold" data-dlis="${r.id}">Download as JPG</button><button class="btn danger" id="is_change_location_saved">Change Save Location</button>${ro?'':`<button class="btn danger" data-delis="${r.id}">Delete</button>`}</div>
         </div>
         <div style="overflow-x:auto;">
         <table>
@@ -5298,6 +5396,27 @@ function renderInvestors(main){
   main.querySelectorAll('[data-period]').forEach(b=>{
     b.onclick = ()=>{ investorPeriod = b.dataset.period; render(); };
   });
+  // downloading an already-saved summary is a read action, same as the
+  // Party/Supplier Ledger JPG exports — not gated behind edit access, so
+  // wire it before the `if(ro) return;` below.
+  main.querySelectorAll('[data-dlis]').forEach(b=>{
+    b.onclick = async()=>{
+      const r = state.investorSummaries.find(x=>x.id===b.dataset.dlis);
+      if(!r) return;
+      const dir = await fsResolveSaveDir(false);
+      try{
+        await downloadInvestorSummaryImage(r, dir);
+        showToast(dir ? `Investor summary saved to folder "${dir.name}"` : 'Investor summary saved and downloaded');
+      }catch(e){ await showAlert(e.message||'Could not save the summary'); }
+    };
+  });
+  if(main.querySelector('#is_change_location_saved')){
+    main.querySelector('#is_change_location_saved').onclick = async()=>{
+      if(!fsApiSupported()){ await showAlert("Your browser doesn't support choosing a save folder. Use Chrome or Edge for this, or just use your browser's normal Downloads folder."); return; }
+      const dir = await fsResolveSaveDir(true);
+      if(dir){ showToast(`Save location updated to "${dir.name}" — future downloads will go there`); render(); }
+    };
+  }
   if(ro) return;
   const form = main.querySelector('.form-grid').closest('section');
   main.querySelector('#i_add').onclick=guardDoubleSubmit('i_add', async()=>{
@@ -6505,6 +6624,9 @@ function renderSettings(main){
         <div><label>Credit Recovery Reminder — days before</label><input type="number" id="cr_rem" value="${state.settings.creditReminderDays}" ${ce?'':'disabled'}></div>
       </div>
       <div class="settings-note" style="margin-bottom:12px;">
+        <label style="display:flex;align-items:center;gap:8px;color:var(--ink);"><input type="checkbox" id="show_cheque_collect" ${state.settings.showChequeCollectReminder!==false?'checked':''} ${ce?'':'disabled'}> Show "Cheque to Collect" reminders on the Dashboard for cheques received but not yet cleared ("Cheque to Pay" reminders for issued cheques are unaffected).</label>
+      </div>
+      <div class="settings-note" style="margin-bottom:12px;">
         <label style="display:flex;align-items:center;gap:8px;color:var(--ink);"><input type="checkbox" id="setup_mode" ${state.settings.setupMode?'checked':''} ${ce?'':'disabled'}> Historical Data Entry Mode — while this is on, every new Sale/Purchase is marked "Historical" and is <b>permanently</b> excluded from Stock, Cash in Hand, Bank balances and Profit (and skips the oversell/unit guards, so old records can be entered in any order, even without a matching Purchase on file). It still counts immediately and permanently toward the Party/Supplier Ledger, Recoverable/Payable Due, and Dashboard reminders — that's the only thing this mode is for. Turning it off only changes how the <b>next new</b> entry is tagged; it does not go back and change anything already marked Historical.</label>
       </div>
       <h2 style="margin-top:20px;">Theme</h2>
@@ -6671,10 +6793,11 @@ function renderSettings(main){
       const chequeReminderDays = Number(main.querySelector('#c_rem').value)||0;
       const creditReminderDays = Number(main.querySelector('#cr_rem').value)||0;
       const setupMode = main.querySelector('#setup_mode').checked;
+      const showChequeCollectReminder = main.querySelector('#show_cheque_collect').checked;
       const themeColor = main.querySelector('#theme_color').value;
       const fontSize = main.querySelector('#font_size').value;
       try{
-        await api('PATCH','/api/settings', {...state.settings, chequeReminderDays, creditReminderDays, setupMode, themeColor, fontSize});
+        await api('PATCH','/api/settings', {...state.settings, chequeReminderDays, creditReminderDays, setupMode, showChequeCollectReminder, themeColor, fontSize});
         // turning Historical Data Entry Mode off doesn't just change
         // settings — the server also unstages every historical sale/purchase
         // and recomputes stock/profit for them (unstageHistoricalEntries).
