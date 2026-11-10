@@ -33,7 +33,7 @@
   body{margin:0;padding:0;background:var(--bg);color:var(--ink);overflow-x:hidden;
     font-family:'Segoe UI',system-ui,sans-serif;direction:ltr;}
   .app{max-width:none;margin:0;width:100%;min-height:100vh;min-height:100dvh;display:flex;flex-direction:row;}
-  .sidebar{width:248px;flex:0 0 248px;background:var(--sidebar-bg);
+  .sidebar{width:218px;flex:0 0 218px;background:var(--sidebar-bg);
     display:flex;flex-direction:column;padding:calc(10px*var(--nav-scale)) 12px;position:sticky;top:0;align-self:flex-start;
     height:100vh;height:100dvh;overflow:hidden;}
   .brand{display:flex;gap:8px;align-items:center;padding:3px 4px calc(10px*var(--nav-scale));border-bottom:1px solid var(--sidebar-line);margin-bottom:calc(8px*var(--nav-scale));}
@@ -48,7 +48,7 @@
   nav.tabs::-webkit-scrollbar{display:none;}
   nav.tabs button{flex:0 0 auto;display:flex;align-items:center;gap:10px;text-align:left;background:transparent;
     border:none;color:var(--sidebar-text);padding:calc(8px*var(--nav-scale)) 10px;font-size:calc(13.5px*var(--nav-scale));font-family:inherit;cursor:pointer;
-    border-radius:8px;white-space:nowrap;}
+    border-radius:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0;}
   nav.tabs button .tab-icon{font-size:calc(15px*var(--nav-scale));flex:0 0 18px;text-align:center;opacity:.9;}
   nav.tabs button.active{color:var(--sidebar-text-active);background:var(--sidebar-active-bg);font-weight:600;}
   nav.tabs button:hover:not(.active){background:var(--sidebar-hover-bg);color:var(--sidebar-text-active);}
@@ -56,7 +56,7 @@
     border-top:1px solid var(--sidebar-line);}
   .sidebar-bottom .settings-btn{flex:0 0 auto;display:flex;align-items:center;gap:10px;text-align:left;background:transparent;
     border:none;color:var(--sidebar-text);padding:calc(8px*var(--nav-scale)) 10px;font-size:calc(13.5px*var(--nav-scale));font-family:inherit;cursor:pointer;
-    border-radius:8px;white-space:nowrap;width:100%;}
+    border-radius:8px;white-space:nowrap;width:100%;overflow:hidden;text-overflow:ellipsis;min-width:0;}
   .sidebar-bottom .settings-btn .tab-icon{font-size:calc(15px*var(--nav-scale));flex:0 0 18px;text-align:center;opacity:.9;}
   .sidebar-bottom .settings-btn.active{color:var(--sidebar-text-active);background:var(--sidebar-active-bg);font-weight:600;}
   .sidebar-bottom .settings-btn:hover:not(.active){background:var(--sidebar-hover-bg);color:var(--sidebar-text-active);}
@@ -141,9 +141,10 @@
   .pill.role{background:var(--gold-soft);color:var(--indigo-dark);}
   .empty{color:var(--ink-soft);font-size:13px;padding:14px 0;text-align:center;}
   .alert-list{display:flex;flex-direction:column;gap:5px;}
-  .alert{background:#FFFBEB;border:1px solid #FDE68A;border-radius:9px;padding:6px 12px;font-size:13px;
-    color:#92400E;}
+  .alert{background:#FFFBEB;border:1px solid #FDE68A;border-radius:9px;padding:10px 14px;font-size:12px;line-height:1.7;
+    color:#92400E;white-space:nowrap;overflow-x:auto;}
   .alert.overdue{background:#FEF2F2;border-color:#FECACA;color:#991B1B;}
+  .alert.cheque-cash{background:#E0F2FE;border-color:#7DD3FC;color:#075985;}
   .recovery-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:10px;align-content:start;}
   .recovery-box{background:var(--panel);border:1px solid var(--line);border-radius:9px;overflow:hidden;}
   .recovery-box-name{padding:7px 12px;font-weight:700;font-size:13px;border-bottom:1px solid var(--line);}
@@ -1943,13 +1944,28 @@ function partyColor(name){
 }
 function reminderAlerts(){
   const alerts = [];
-  state.cheques.filter(c=>c.status==='pending' && (c.direction==='issued' || state.settings.showChequeCollectReminder!==false)).forEach(c=>{
+  state.cheques.filter(c=>c.status==='pending' && c.direction==='issued').forEach(c=>{
     const d = daysUntil(c.dueDate);
     if(d <= state.settings.chequeReminderDays){
-      const label = c.direction==='issued' ? 'Cheque to Pay' : 'Cheque to Collect';
-      alerts.push({overdue:d<0, party:c.party, text:`${label} — ${c.party}${c.bank?` (${c.bank})`:''}: Rs ${fmt(c.amount)}, due ${fmtDate(c.dueDate)} ${d<0?`(${daysLabel(Math.abs(d))} overdue)`:`(${daysLabel(d)} left)`}`});
+      alerts.push({overdue:d<0, party:c.party, text:`Cheque to Pay — ${c.party}${c.bank?` (${c.bank})`:''}: Rs ${fmt(c.amount)}, due ${fmtDate(c.dueDate)} ${d<0?`(${daysLabel(Math.abs(d))} overdue)`:`(${daysLabel(d)} left)`}`});
     }
   });
+  // "Cheque Due Date" — every cheque RECEIVED from a party, same
+  // reminder-days window as every other alert here (starts showing
+  // chequeReminderDays before the due date), and — like every other alert
+  // here — never disappears again once overdue (d stays negative, so it
+  // stays <= chequeReminderDays), only once actually Cleared. Styled sky
+  // blue (kind: 'chequeCollect') so it reads as its own category at a
+  // glance; the left-edge stripe still follows partyColor like every other
+  // alert.
+  if(state.settings.showChequeCollectReminder!==false){
+    state.cheques.filter(c=>c.status==='pending' && c.direction==='received').forEach(c=>{
+      const d = daysUntil(c.dueDate);
+      if(d <= state.settings.chequeReminderDays){
+        alerts.push({overdue:d<0, kind:'chequeCollect', party:c.party, text:`Cheque Due Date — ${c.party}${c.bank?` (${c.bank})`:''}: Rs ${fmt(c.amount)}, due ${fmtDate(c.dueDate)} ${d<0?`(${daysLabel(Math.abs(d))} overdue)`:`(${daysLabel(d)} left)`}`});
+      }
+    });
+  }
   state.sales.filter(s=>s.type==='credit' && s.dueDate).forEach(s=>{
     const outstanding = creditSaleOutstanding(s);
     if(outstanding<=0) return;
@@ -3339,6 +3355,26 @@ function renderDashboard(main){
   const hideInvestment = !dashReveal.investment;
   const ce = canEditActiveClient();
   main.innerHTML = `
+    <section class="block">
+      <h2>Reminders</h2>
+      <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start;">
+        <div class="alert-list" style="flex:1 1 320px;min-width:280px;">${alerts.length ? alerts.map(a=>`<div class="alert ${a.kind==='chequeCollect'?'cheque-cash':(a.overdue?'overdue':'')}" style="border-left:8px solid ${partyColor(a.party)};">${a.text}</div>`).join('') : '<div class="empty">No reminders right now</div>'}</div>
+        <div class="recovery-grid" style="flex:1 1 320px;min-width:280px;">${(()=>{ const sum = partyRecoverySummary(); return sum.length ? sum.map(v=>`
+          <div class="recovery-box" style="border-left:6px solid ${partyColor(v.name)};">
+            <div class="recovery-box-name">${v.name}</div>
+            <div class="recovery-box-split">
+              <div class="recovery-box-cell due-soon">
+                <div class="recovery-box-label">Due Soon (${state.settings.creditReminderDays} ${state.settings.creditReminderDays===1?'Day':'Days'} Left)</div>
+                <div class="recovery-box-amount">${v.dueSoon>0?'Rs '+fmt(v.dueSoon):'—'}</div>
+              </div>
+              <div class="recovery-box-cell overdue">
+                <div class="recovery-box-label">Overdue</div>
+                <div class="recovery-box-amount">${v.overdue>0?'Rs '+fmt(v.overdue):'—'}</div>
+              </div>
+            </div>
+          </div>`).join('') : '<div class="empty">No recovery due soon or overdue</div>'; })()}</div>
+      </div>
+    </section>
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
       <button class="eye-btn big" id="dash_toggle_other" title="${hideOther?'Show':'Hide'} other amounts">${hideOther?'\u{1F441}️':'\u{1F648}'}</button>
     </div>
@@ -3380,26 +3416,6 @@ function renderDashboard(main){
         </tbody>
       </table>
       </div>` : ''}
-    </section>
-    <section class="block">
-      <h2>Reminders</h2>
-      <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start;">
-        <div class="alert-list" style="flex:1 1 320px;min-width:280px;">${alerts.length ? alerts.map(a=>`<div class="alert ${a.overdue?'overdue':''}" style="border-left:8px solid ${partyColor(a.party)};">${a.text}</div>`).join('') : '<div class="empty">No reminders right now</div>'}</div>
-        <div class="recovery-grid" style="flex:1 1 320px;min-width:280px;">${(()=>{ const sum = partyRecoverySummary(); return sum.length ? sum.map(v=>`
-          <div class="recovery-box" style="border-left:6px solid ${partyColor(v.name)};">
-            <div class="recovery-box-name">${v.name}</div>
-            <div class="recovery-box-split">
-              <div class="recovery-box-cell due-soon">
-                <div class="recovery-box-label">Due Soon (${state.settings.creditReminderDays} ${state.settings.creditReminderDays===1?'Day':'Days'} Left)</div>
-                <div class="recovery-box-amount">${v.dueSoon>0?'Rs '+fmt(v.dueSoon):'—'}</div>
-              </div>
-              <div class="recovery-box-cell overdue">
-                <div class="recovery-box-label">Overdue</div>
-                <div class="recovery-box-amount">${v.overdue>0?'Rs '+fmt(v.overdue):'—'}</div>
-              </div>
-            </div>
-          </div>`).join('') : '<div class="empty">No recovery due soon or overdue</div>'; })()}</div>
-      </div>
     </section>
   `;
   main.querySelector('#dash_toggle_other').onclick = ()=>{ dashReveal.other = !dashReveal.other; render(); };
@@ -6624,7 +6640,7 @@ function renderSettings(main){
         <div><label>Credit Recovery Reminder — days before</label><input type="number" id="cr_rem" value="${state.settings.creditReminderDays}" ${ce?'':'disabled'}></div>
       </div>
       <div class="settings-note" style="margin-bottom:12px;">
-        <label style="display:flex;align-items:center;gap:8px;color:var(--ink);"><input type="checkbox" id="show_cheque_collect" ${state.settings.showChequeCollectReminder!==false?'checked':''} ${ce?'':'disabled'}> Show "Cheque to Collect" reminders on the Dashboard for cheques received but not yet cleared ("Cheque to Pay" reminders for issued cheques are unaffected).</label>
+        <label style="display:flex;align-items:center;gap:8px;color:var(--ink);"><input type="checkbox" id="show_cheque_collect" ${state.settings.showChequeCollectReminder!==false?'checked':''} ${ce?'':'disabled'}> Show "Cheque Due Date" reminders on the Dashboard for cheques received but not yet cleared (same reminder-days window as other reminders; "Cheque to Pay" reminders for issued cheques are unaffected).</label>
       </div>
       <div class="settings-note" style="margin-bottom:12px;">
         <label style="display:flex;align-items:center;gap:8px;color:var(--ink);"><input type="checkbox" id="setup_mode" ${state.settings.setupMode?'checked':''} ${ce?'':'disabled'}> Historical Data Entry Mode — while this is on, every new Sale/Purchase is marked "Historical" and is <b>permanently</b> excluded from Stock, Cash in Hand, Bank balances and Profit (and skips the oversell/unit guards, so old records can be entered in any order, even without a matching Purchase on file). It still counts immediately and permanently toward the Party/Supplier Ledger, Recoverable/Payable Due, and Dashboard reminders — that's the only thing this mode is for. Turning it off only changes how the <b>next new</b> entry is tagged; it does not go back and change anything already marked Historical.</label>
