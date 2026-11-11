@@ -1200,6 +1200,11 @@ function enableEnterNav(container, addBtnSelector){
 }
 // text input with a keyboard-navigable suggestion list (variety names etc.)
 function attachCombo(input, getOptions, container){
+  // the browser's own remembered-values dropdown (with its per-entry "x" to
+  // delete) stacks on top of this custom combo-list below it — same field,
+  // two overlapping suggestion lists. autocomplete="off" suppresses that
+  // browser-native one, leaving only this one.
+  input.setAttribute('autocomplete', 'off');
   input.classList.add('combo-input');
   input.parentElement.classList.add('field-wrap');
   const box = document.createElement('div');
@@ -3682,6 +3687,18 @@ function saleHistorySectionHtml(){
   const sorted = filtered.slice().sort(byRecencyDesc);
   const rows = applySortDir(filterVal==='__all__' ? sorted.slice(0,10) : sorted, 'saleHistory');
   const saleCost = s => Number(s.total) - Number(s.profit||0);
+  // Gross Profit (s.profit) is Sale Rate − Batch Cost only — the commission
+  // agent's cut is a separate expense, deducted only once in aggregate at
+  // the Trade Summary level ("Broker Commission"), never per-sale. Net
+  // Profit here is that same gross figure minus just THIS sale's own
+  // commission share, shown side-by-side on request so both are visible at
+  // the line-item level without changing how the Trade Summary itself adds up.
+  const netProfit = s => {
+    const gross = Number(s.profit||0);
+    if(!s.partnerId) return gross;
+    const pct = Number(s.partnerPercent)||0;
+    return gross - gross*(pct/100);
+  };
   const profitPctRaw = s => Number(s.total)>0 ? (Number(s.profit||0)/Number(s.total)*100) : 0;
   // Credit tied up for 90 days ties up the capital for 3 months, 45 days for
   // 1.5 months, etc. — so the profit % earned over that whole period is spread
@@ -3706,12 +3723,14 @@ function saleHistorySectionHtml(){
     const totalSale = rows.reduce((a,s)=>a+Number(s.total),0);
     const totalCost = rows.reduce((a,s)=>a+saleCost(s),0);
     const totalProfit = rows.reduce((a,s)=>a+Number(s.profit||0),0);
+    const totalNetProfit = rows.reduce((a,s)=>a+netProfit(s),0);
     const weightedMonthly = rows.reduce((a,s)=>a+profitPctMonthly(s)*Number(s.total),0);
     const avgMonthlyPct = totalSale>0 ? (weightedMonthly/totalSale) : 0;
     return `<div class="cards" style="margin-bottom:14px;">
       <div class="card"><div class="label">Total Sale Value</div><div class="value-row"><div class="value">Rs ${fmt(totalSale)}</div></div></div>
       <div class="card"><div class="label">Total Cost</div><div class="value-row"><div class="value">Rs ${fmt(totalCost)}</div></div></div>
-      <div class="card"><div class="label">Total Profit</div><div class="value-row"><div class="value">Rs ${fmt(totalProfit)}</div></div></div>
+      <div class="card"><div class="label">Total Gross Profit</div><div class="value-row"><div class="value">Rs ${fmt(totalProfit)}</div></div></div>
+      <div class="card"><div class="label">Total Net Profit (after this sale's own Commission Agent share)</div><div class="value-row"><div class="value">Rs ${fmt(totalNetProfit)}</div></div></div>
       <div class="card"><div class="label">Avg. Profit %/Month</div><div class="value-row"><div class="value">${avgMonthlyPct.toFixed(1)}%</div></div></div>
     </div>`;
   })();
@@ -3728,7 +3747,7 @@ function saleHistorySectionHtml(){
       ${sortToggleHtml('saleHistory')}
       <div style="overflow-x:auto;">
       <table>
-        <thead><tr><th>Date</th>${filterVal==='__all__'?'<th>Party</th>':''}<th>Item</th><th>Qty</th><th>Cost/Unit</th><th>Total Cost</th><th>Sale Rate</th><th>Sale Value</th><th>Profit (Rs)</th><th>Profit %/Month</th></tr></thead>
+        <thead><tr><th>Date</th>${filterVal==='__all__'?'<th>Party</th>':''}<th>Item</th><th>Qty</th><th>Cost/Unit</th><th>Total Cost</th><th>Sale Rate</th><th>Sale Value</th><th>Gross Profit (Rs)</th><th>Net Profit (Rs)</th><th>Profit %/Month</th></tr></thead>
         <tbody>
           ${rows.map(s=>{ const months = monthsForSale(s); const cost = saleCost(s); const costPerUnit = Number(s.qty)>0 ? cost/Number(s.qty) : 0; return `<tr>
             <td>${fmtDate(s.date)}</td>
@@ -3740,12 +3759,13 @@ function saleHistorySectionHtml(){
             <td>Rs ${fmtQtyPlain(s.rate)}</td>
             <td>Rs ${fmtQtyPlain(s.total)}</td>
             <td>Rs ${fmtQtyPlain(s.profit||0)}</td>
+            <td>Rs ${fmtQtyPlain(netProfit(s))}${s.partnerId?` <span style="opacity:.6;font-size:11px;">(${Number(s.partnerPercent)||0}% to agent)</span>`:''}</td>
             <td>${profitPctMonthly(s).toFixed(1)}%${months?` <span style="opacity:.6;font-size:11px;">(${months.toFixed(1)} mo)</span>`:(s.type==='credit'?' <span style="opacity:.6;font-size:11px;">(no credit days set)</span>':' <span style="opacity:.6;font-size:11px;">(cash)</span>')}</td>
-          </tr>`; }).join('') || `<tr><td colspan="${filterVal==='__all__'?10:9}" class="empty">No sales found</td></tr>`}
+          </tr>`; }).join('') || `<tr><td colspan="${filterVal==='__all__'?11:10}" class="empty">No sales found</td></tr>`}
         </tbody>
       </table>
       </div>
-      <div class="settings-note" style="margin-top:10px;">Profit %/Month = (Profit ÷ Sale Value × 100) ÷ months the sale's credit was outstanding (Credit Days ÷ 30 — e.g. 90 days = 3 months, 45 days = 1.5 months), using each sale's actual cost basis (the purchase batch it was sold from). Cash sales have no credit period, so their profit % is shown as-is. Historical (staged) sales are excluded, same as elsewhere in Reports. "All Parties" shows only the most recent 10 entries; pick a specific party to see every sale made to them, along with their total cost and total profit.</div>
+      <div class="settings-note" style="margin-top:10px;">Gross Profit = Sale Rate − this sale's Purchase Batch cost. Net Profit = Gross Profit minus just this sale's own Commission Agent share (if one is attached) — not the same deduction as the Dashboard's Trade Summary, which subtracts total commission across all sales only once, in aggregate. Profit %/Month = (Gross Profit ÷ Sale Value × 100) ÷ months the sale's credit was outstanding (Credit Days ÷ 30 — e.g. 90 days = 3 months, 45 days = 1.5 months). Cash sales have no credit period, so their profit % is shown as-is. Historical (staged) sales are excluded, same as elsewhere in Reports. "All Parties" shows only the most recent 10 entries; pick a specific party to see every sale made to them, along with their total cost and total profit.</div>
     </section>`;
 }
 function wireSaleHistorySection(main){
