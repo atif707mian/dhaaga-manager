@@ -1947,7 +1947,7 @@ function reminderAlerts(){
   state.cheques.filter(c=>c.status==='pending' && c.direction==='issued').forEach(c=>{
     const d = daysUntil(c.dueDate);
     if(d <= state.settings.chequeReminderDays){
-      alerts.push({overdue:d<0, party:c.party, text:`Cheque to Pay — ${c.party}${c.bank?` (${c.bank})`:''}: Rs ${fmt(c.amount)}, due ${fmtDate(c.dueDate)} ${d<0?`(${daysLabel(Math.abs(d))} overdue)`:`(${daysLabel(d)} left)`}`});
+      alerts.push({overdue:d<0, kind:'chequePay', party:c.party, text:`Cheque to Pay — ${c.party}${c.bank?` (${c.bank})`:''}: Rs ${fmt(c.amount)}, due ${fmtDate(c.dueDate)} ${d<0?`(${daysLabel(Math.abs(d))} overdue)`:`(${daysLabel(d)} left)`}`});
     }
   });
   // "Cheque Due Date" — every cheque RECEIVED from a party, same
@@ -1971,7 +1971,7 @@ function reminderAlerts(){
     if(outstanding<=0) return;
     const d = daysUntil(s.dueDate);
     if(d <= state.settings.creditReminderDays){
-      alerts.push({overdue:d<0, party:s.party, text:`Recovery — ${s.party}: Rs ${fmt(outstanding)}, due ${fmtDate(s.dueDate)} ${d<0?`(${daysLabel(Math.abs(d))} overdue)`:`(${daysLabel(d)} left)`}`});
+      alerts.push({overdue:d<0, kind:'recovery', party:s.party, text:`Recovery — ${s.party}: Rs ${fmt(outstanding)}, due ${fmtDate(s.dueDate)} ${d<0?`(${daysLabel(Math.abs(d))} overdue)`:`(${daysLabel(d)} left)`}`});
     }
   });
   // opening-balance receivables/payables (money already owed before this app
@@ -1982,13 +1982,13 @@ function reminderAlerts(){
   state.parties.filter(p=>p.dueDate && Number(p.openingBalance)>0 && partyPendingTotal(p.name)>0).forEach(p=>{
     const d = daysUntil(p.dueDate);
     if(d <= state.settings.creditReminderDays){
-      alerts.push({overdue:d<0, party:p.name, text:`Recovery (Opening Balance) — ${p.name}: Rs ${fmt(p.openingBalance)}, due ${fmtDate(p.dueDate)} ${d<0?`(${daysLabel(Math.abs(d))} overdue)`:`(${daysLabel(d)} left)`}`});
+      alerts.push({overdue:d<0, kind:'recoveryOpening', party:p.name, text:`Recovery (Opening Balance) — ${p.name}: Rs ${fmt(p.openingBalance)}, due ${fmtDate(p.dueDate)} ${d<0?`(${daysLabel(Math.abs(d))} overdue)`:`(${daysLabel(d)} left)`}`});
     }
   });
   state.suppliers.filter(s=>s.dueDate && Number(s.openingBalance)>0 && supplierPendingTotal(s.name)>0).forEach(s=>{
     const d = daysUntil(s.dueDate);
     if(d <= state.settings.creditReminderDays){
-      alerts.push({overdue:d<0, party:s.name, text:`Payable (Opening Balance) — ${s.name}: Rs ${fmt(s.openingBalance)}, due ${fmtDate(s.dueDate)} ${d<0?`(${daysLabel(Math.abs(d))} overdue)`:`(${daysLabel(d)} left)`}`});
+      alerts.push({overdue:d<0, kind:'payableOpening', party:s.name, text:`Payable (Opening Balance) — ${s.name}: Rs ${fmt(s.openingBalance)}, due ${fmtDate(s.dueDate)} ${d<0?`(${daysLabel(Math.abs(d))} overdue)`:`(${daysLabel(d)} left)`}`});
     }
   });
   // personal loans have no due date — they're meant to be cleared as soon as
@@ -1996,9 +1996,14 @@ function reminderAlerts(){
   state.personalLoans.forEach(l=>{
     const outstanding = personalLoanOutstanding(l);
     if(outstanding<=0) return;
-    alerts.push({overdue:true, party:l.lender, text:`Personal Loan — repay ${l.lender}: Rs ${fmt(outstanding)} outstanding, borrowed ${fmtDate(l.date)}`});
+    alerts.push({overdue:true, kind:'personalLoan', party:l.lender, text:`Personal Loan — repay ${l.lender}: Rs ${fmt(outstanding)} outstanding, borrowed ${fmtDate(l.date)}`});
   });
-  return alerts.sort((a,b)=> (a.overdue===b.overdue)?0:(a.overdue?-1:1));
+  // Grouped by category first (so every "Cheque Due Date" card, for example,
+  // stays together as one block instead of being split apart by the
+  // overdue/due-soon partition below) — only within the same category does
+  // overdue-first ordering apply.
+  const KIND_ORDER = ['chequePay','chequeCollect','recovery','recoveryOpening','payableOpening','personalLoan'];
+  return alerts.sort((a,b)=> (KIND_ORDER.indexOf(a.kind)-KIND_ORDER.indexOf(b.kind)) || (a.overdue===b.overdue?0:(a.overdue?-1:1)));
 }
 // Dashboard's per-party Recovery summary boxes, next to the Reminders list —
 // same two data sources as reminderAlerts()'s "Recovery" entries (credit
@@ -3357,9 +3362,8 @@ function renderDashboard(main){
   main.innerHTML = `
     <section class="block">
       <h2>Reminders</h2>
-      <div style="display:flex;gap:20px;flex-wrap:wrap;align-items:flex-start;">
-        <div class="alert-list" style="flex:1 1 320px;min-width:280px;">${alerts.length ? alerts.map(a=>`<div class="alert ${a.kind==='chequeCollect'?'cheque-cash':(a.overdue?'overdue':'')}" style="border-left:8px solid ${partyColor(a.party)};">${a.text}</div>`).join('') : '<div class="empty">No reminders right now</div>'}</div>
-        <div class="recovery-grid" style="flex:1 1 320px;min-width:280px;">${(()=>{ const sum = partyRecoverySummary(); return sum.length ? sum.map(v=>`
+      <div class="alert-list">${alerts.length ? alerts.map(a=>`<div class="alert ${a.kind==='chequeCollect'?'cheque-cash':(a.overdue?'overdue':'')}" style="border-left:8px solid ${partyColor(a.party)};">${a.text}</div>`).join('') : '<div class="empty">No reminders right now</div>'}</div>
+      <div class="recovery-grid" style="margin-top:16px;">${(()=>{ const sum = partyRecoverySummary(); return sum.length ? sum.map(v=>`
           <div class="recovery-box" style="border-left:6px solid ${partyColor(v.name)};">
             <div class="recovery-box-name">${v.name}</div>
             <div class="recovery-box-split">
@@ -3373,7 +3377,6 @@ function renderDashboard(main){
               </div>
             </div>
           </div>`).join('') : '<div class="empty">No recovery due soon or overdue</div>'; })()}</div>
-      </div>
     </section>
     <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px;">
       <button class="eye-btn big" id="dash_toggle_other" title="${hideOther?'Show':'Hide'} other amounts">${hideOther?'\u{1F441}️':'\u{1F648}'}</button>
