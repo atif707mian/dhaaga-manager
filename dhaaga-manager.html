@@ -1549,11 +1549,11 @@ function wireShortfallCover(main, prefix, getAccount, getTotal, getAvailable, ge
     const prevVal0 = sel0.value;
     sel0.innerHTML = fundingCoverOptionsHtml([account, ...extra], getAvailable, remaining, prevVal0);
     w0.querySelector('label').textContent = `Cover Shortfall From (${(allAccounts().find(a=>a.id===account)||{}).name||account} is short by Rs ${fmtPlain(remaining)})`;
-    w0.style.display = 'block';
+    w0.style.display = 'flex';
     const val0 = sel0.value;
     if(!val0 || val0==='__loan__'){
       w1.style.display = 'none';
-      lenderWrap.style.display = val0==='__loan__' ? 'block' : 'none';
+      lenderWrap.style.display = val0==='__loan__' ? 'flex' : 'none';
       return;
     }
     remaining -= getAvailable(val0);
@@ -1562,8 +1562,8 @@ function wireShortfallCover(main, prefix, getAccount, getTotal, getAvailable, ge
     const prevVal1 = sel1.value;
     sel1.innerHTML = fundingCoverOptionsHtml([account, val0, ...extra], getAvailable, remaining, prevVal1);
     w1.querySelector('label').textContent = `Cover Remaining Shortfall From (still short by Rs ${fmtPlain(remaining)})`;
-    w1.style.display = 'block';
-    lenderWrap.style.display = sel1.value==='__loan__' ? 'block' : 'none';
+    w1.style.display = 'flex';
+    lenderWrap.style.display = sel1.value==='__loan__' ? 'flex' : 'none';
   }
   main.querySelector(`#${prefix}_cover_account`).addEventListener('change', recompute);
   main.querySelector(`#${prefix}_cover_account1`).addEventListener('change', recompute);
@@ -3793,18 +3793,17 @@ function renderSales(main){
         <div><label>Quantity</label><input type="number" id="s_qty" value="${editing?editing.qty:''}"></div>
         <div><label>Unit</label><select id="s_unit"><option value="bags" ${(!editing||editing.unit==='bags')?'selected':''}>Bags</option><option value="kg" ${editing&&editing.unit==='kg'?'selected':''}>KG</option></select></div>
         <div id="s_batch_wrap" style="display:none;"><label>Purchase Batch (this sale's cost)</label><select id="s_batch" class="select-required"></select></div>
-        <div id="s_profit_pct_wrap" style="display:${(!editing && !state.settings.setupMode) ? 'block' : 'none'};"><label>Profit % (optional — suggests a Rate)</label><input type="number" id="s_profit_pct" placeholder="e.g. 2.5"></div>
         <div><label>Rate per Unit</label><input type="number" id="s_rate" value="${editing?editing.rate:''}"></div>
         <div><label>Bill / Total Amount</label><input id="s_total_display" value="${editing?fmtQtyPlain(Number(editing.qty)*Number(editing.rate)):''}" disabled></div>
         <div><label>Payment Type</label>
           <select id="s_type"><option value="cash" ${editing&&editing.type==='cash'?'selected':''}>Cash</option><option value="credit" ${editing&&editing.type==='credit'?'selected':''}>Credit</option></select>
         </div>
-        <div id="s_acc_wrap" style="display:${editing&&editing.type==='credit'?'none':'block'};"><label>Received Into</label><select id="s_account">${accountOptionsHtml(editing?editing.account:'cash')}</select></div>
+        <div id="s_acc_wrap" style="display:${editing&&editing.type==='credit'?'none':'flex'};"><label>Received Into</label><select id="s_account">${accountOptionsHtml(editing?editing.account:'cash')}</select></div>
         ${state.partners.length ? `
         <div><label>Commission Agent</label><select id="s_partner"><option value="">— none —</option>${state.partners.map(p=>`<option value="${p.id}" ${editing&&editing.partnerId===p.id?'selected':''}>${p.name}</option>`).join('')}</select></div>
         <div><label>Agent's Commission % of this sale's profit</label><input type="number" id="s_partner_pct" placeholder="e.g. 10" value="${editing&&editing.partnerPercent?editing.partnerPercent:''}"></div>` : ''}
-        <div id="s_days_wrap" style="display:${editing&&editing.type==='credit'?'block':'none'};"><label>Credit Days</label><input type="number" id="s_days" placeholder="e.g. 45" value="${editing&&editing.creditDays?editing.creditDays:''}"></div>
-        <div id="s_due_wrap" style="display:${editing&&editing.type==='credit'?'block':'none'};"><label>Expected Recovery Date</label><input type="date" id="s_due" value="${editing&&editing.dueDate?editing.dueDate:''}"></div>
+        <div id="s_days_wrap" style="display:${editing&&editing.type==='credit'?'flex':'none'};"><label>Credit Days</label><input type="number" id="s_days" placeholder="e.g. 45" value="${editing&&editing.creditDays?editing.creditDays:''}"></div>
+        <div id="s_due_wrap" style="display:${editing&&editing.type==='credit'?'flex':'none'};"><label>Expected Recovery Date</label><input type="date" id="s_due" value="${editing&&editing.dueDate?editing.dueDate:''}"></div>
       </div>
       <button class="btn gold" id="s_add">${editing?'Save Changes':'Add Sale'}</button>
       ${editing?'<button class="btn danger" id="s_cancel" style="margin-left:8px;">Cancel Edit</button>':''}
@@ -3915,7 +3914,7 @@ function renderSales(main){
     if(!batches.length){ s_batch_wrap.style.display='none'; s_batch.innerHTML=''; return; }
     const prevVal = s_batch.value || (editing?editing.sourcePurchaseId:'') || '';
     s_batch.innerHTML = `<option value="" ${!prevVal?'selected':''}>— select a batch —</option>` + batches.map(b=>`<option value="${b.id}" ${b.id===prevVal?'selected':''}>${b.label}</option>`).join('');
-    s_batch_wrap.style.display = 'block';
+    s_batch_wrap.style.display = 'flex';
   }
   function updateQtyHint(){
     const name = main.querySelector('#s_item').value.trim();
@@ -3943,40 +3942,11 @@ function renderSales(main){
   }
   s_qty.addEventListener('input', updateSaleTotalDisplay);
   s_rate.addEventListener('input', updateSaleTotalDisplay);
-  // Profit % box: a one-time price SUGGESTION, never persisted and never
-  // sent to the server — it only ever writes a number into Rate, which the
-  // user is always free to then edit by hand (the final bill is never locked
-  // to this %). It only exists on a fresh New Sale Entry — once a sale is
-  // saved, Edit Sale Entry never shows it again (see its display:none above).
-  const s_profit_pct = main.querySelector('#s_profit_pct');
-  if(s_profit_pct){
-    function batchCostRate(){
-      if(!usesBatches || s_batch_wrap.style.display==='none' || !s_batch.value) return null;
-      const name = main.querySelector('#s_item').value.trim();
-      const unit = s_unit.value;
-      const batches = saleBatchesForItem(name, unit, editing?editing.id:null);
-      const chosen = batches.find(b=>b.id===s_batch.value);
-      return chosen ? Number(chosen.rate) : null;
-    }
-    function applyProfitPct(){
-      const pct = Number(s_profit_pct.value);
-      const cost = batchCostRate();
-      if(cost==null || !s_profit_pct.value || !isFinite(pct)) return;
-      // round to 2dp FIRST — cost*(1+pct/100) is routinely something like
-      // 30749.999999999996 in raw floating point, which would otherwise fail
-      // Number.isInteger and show "30750.00" instead of a clean "30750".
-      const suggested = Math.round(cost * (1 + pct/100) * 100) / 100;
-      s_rate.value = Number.isInteger(suggested) ? String(suggested) : suggested.toFixed(2);
-      updateSaleTotalDisplay();
-    }
-    s_profit_pct.addEventListener('input', applyProfitPct);
-    s_batch.addEventListener('change', applyProfitPct);
-  }
   main.querySelector('#s_type').onchange = (e)=>{
     const isCredit = e.target.value==='credit';
-    main.querySelector('#s_due_wrap').style.display = isCredit ? 'block':'none';
-    main.querySelector('#s_days_wrap').style.display = isCredit ? 'block':'none';
-    main.querySelector('#s_acc_wrap').style.display = isCredit ? 'none':'block';
+    main.querySelector('#s_due_wrap').style.display = isCredit ? 'flex':'none';
+    main.querySelector('#s_days_wrap').style.display = isCredit ? 'flex':'none';
+    main.querySelector('#s_acc_wrap').style.display = isCredit ? 'none':'flex';
   };
   main.querySelector('#s_days').oninput = (e)=>{
     const days = Number(e.target.value);
@@ -3999,6 +3969,23 @@ function renderSales(main){
     const partnerPercent = partnerId ? (Number(main.querySelector('#s_partner_pct').value)||0) : 0;
     if(!party||!item||!qty||!rate){ await showAlert('Please fill all required fields'); return; }
     const sourcePurchaseId = usesBatches ? (s_batch.value || null) : (editing ? editing.sourcePurchaseId : null);
+    // QA 2026-11-11: a Rate meant for the Rate box was typed into "Profit %"
+    // instead, which treats the number as a PERCENT markup over the batch's
+    // cost — 35200 there means 35,200%, silently producing an absurd Rate
+    // (cost × 353) with no warning. Catch any wildly implausible margin
+    // here, whichever field actually caused it, before it ever reaches the
+    // server — a legitimate yarn-trading margin never gets close to 500%.
+    if(sourcePurchaseId && sourcePurchaseId!=='opening'){
+      const batch = state.purchases.find(p=>p.id===sourcePurchaseId);
+      if(batch && Number(batch.rate)>0){
+        const costRate = Number(batch.rate);
+        const impliedPct = ((rate-costRate)/costRate)*100;
+        if(Math.abs(impliedPct) > 500){
+          const ok = await showConfirm(`This Rate (Rs ${fmtPlain(rate)}) is ${impliedPct>0?'+':'−'}${fmtPlain(Math.abs(impliedPct))}% vs. this batch's cost (Rs ${fmtPlain(costRate)}) — an unusually large ${impliedPct>0?'profit':'loss'} margin. If you meant to type the Rate itself into the "Profit %" box by mistake, go back and fix it. Continue saving this Rate anyway?`);
+          if(!ok) return;
+        }
+      }
+    }
     const body = {date, party, item, qty, unit, rate, type, account, dueDate: type==='credit'?due:null, creditDays: type==='credit'?creditDays:null, partnerId: partnerId||null, partnerPercent, sourcePurchaseId};
     try {
       if(editing){ await api('PATCH', '/api/sales/'+editing.id, body); editingSaleId = null; }
@@ -4074,7 +4061,7 @@ function renderSales(main){
       creditOpt.hidden = !creditMakesSense;
       creditOpt.disabled = !creditMakesSense;
       if(!creditMakesSense && srSettlementSel.value==='credit') srSettlementSel.value = 'refund';
-      srAccWrap.style.display = srSettlementSel.value==='refund' ? 'block' : 'none';
+      srAccWrap.style.display = srSettlementSel.value==='refund' ? 'flex' : 'none';
       srQty.placeholder = `Up to ${fmtQtyPlain(returnable)} ${sale.unit}`;
     }
     srSaleSel.addEventListener('change', ()=>{ updateSrAccountDefault(); updateSrHint(); });
@@ -4582,7 +4569,7 @@ function renderPurchases(main){
         <div><label>Payment Type</label>
           <select id="p_type"><option value="cash" ${editing&&editing.type==='cash'?'selected':''}>Cash</option><option value="credit" ${editing&&editing.type==='credit'?'selected':''}>Credit (pay later)</option></select>
         </div>
-        <div id="p_acc_wrap" style="display:${editing&&editing.type==='credit'?'none':'block'};"><label>Paid From</label><select id="p_account">${accountOptionsHtmlNoLocker(editing?editing.account:'cash')}</select></div>
+        <div id="p_acc_wrap" style="display:${editing&&editing.type==='credit'?'none':'flex'};"><label>Paid From</label><select id="p_account">${accountOptionsHtmlNoLocker(editing?editing.account:'cash')}</select></div>
         <div id="p_cover_wrap" style="display:none;"><label>Cover Shortfall From</label><select id="p_cover_account" class="select-required"></select></div>
         <div id="p_cover_wrap1" style="display:none;"><label>Cover Remaining Shortfall From</label><select id="p_cover_account1" class="select-required"></select></div>
         <div id="p_lender_wrap" style="display:none;"><label>Lender Name</label><input id="p_lender_name" placeholder="e.g. X-Y-Z"></div>
@@ -4735,7 +4722,7 @@ function renderPurchases(main){
   );
   main.querySelector('#p_account').addEventListener('change', updatePurchaseFunding);
   main.querySelector('#p_type').onchange = (e)=>{
-    main.querySelector('#p_acc_wrap').style.display = e.target.value==='credit' ? 'none':'block';
+    main.querySelector('#p_acc_wrap').style.display = e.target.value==='credit' ? 'none':'flex';
     updatePurchaseFunding();
   };
   main.querySelector('#p_add').onclick = guardDoubleSubmit('p_add', async ()=>{
@@ -4894,7 +4881,7 @@ function renderPurchases(main){
       creditOpt.hidden = !creditMakesSense;
       creditOpt.disabled = !creditMakesSense;
       if(!creditMakesSense && prSettlementSel.value==='credit') prSettlementSel.value = 'refund';
-      prAccWrap.style.display = prSettlementSel.value==='refund' ? 'block' : 'none';
+      prAccWrap.style.display = prSettlementSel.value==='refund' ? 'flex' : 'none';
       prQty.placeholder = `Up to ${fmtQtyPlain(returnable)} ${purchase.unit}`;
     }
     prPurchaseSel.addEventListener('change', updatePrHint);
@@ -6183,8 +6170,8 @@ function renderExpenses(main){
     attachCombo(miSupplierInput, supplierNames, miSupplierInput.closest('section'));
     function syncMiMode(){
       const supplierMode = miModeSel.value==='supplier';
-      miAccWrap.style.display = supplierMode ? 'none' : 'block';
-      miSupplierWrap.style.display = supplierMode ? 'block' : 'none';
+      miAccWrap.style.display = supplierMode ? 'none' : 'flex';
+      miSupplierWrap.style.display = supplierMode ? 'flex' : 'none';
     }
     miModeSel.onchange = syncMiMode;
     syncMiMode();
