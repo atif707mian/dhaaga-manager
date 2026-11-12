@@ -1786,6 +1786,21 @@ function partyTotalSalesAll(party){
 function partyPendingTotal(party){
   return Math.max(0, partyOpeningBalance(party) + partyCreditSalesTotal(party) - partyReceiptsTotal(party));
 }
+// QA 2026-11-12: the Opening Balance's own Due Date reminder/cards (below,
+// and reminderAlerts'/partyRecoverySummary's "Recovery (Opening Balance)")
+// used to show the FULL original openingBalance even after receipts had
+// already paid some of it down — correct only for a party with no credit
+// sales to otherwise absorb those receipts via partyLedgerRows' FIFO pool.
+// This is what's actually left of it: the receipts pool first pays down
+// credit sales (oldest first, same as partyLedgerRows), and only whatever
+// pool is left over after that counts against the Opening Balance.
+function partyOpeningBalanceRemaining(party){
+  const p = state.parties.find(x=>x.name===party);
+  if(!p || Number(p.openingBalance)<=0) return 0;
+  const poolUsed = partyLedgerRows(party).filter(r=>r.sale.type==='credit').reduce((a,r)=>a+r.received,0);
+  const poolLeftover = Math.max(0, partyReceiptsTotal(party) - poolUsed);
+  return Math.max(0, Number(p.openingBalance) - poolLeftover);
+}
 // the mirror case: receipts beyond what's actually owed. Previously this
 // just vanished into partyPendingTotal's Math.max(0, ...) clamp — recorded
 // (with a warning) but with no trace of the overage anywhere. It already
@@ -1836,6 +1851,16 @@ function supplierCreditPurchasesTotal(supplier){
 }
 function supplierPendingTotal(supplier){
   return Math.max(0, supplierOpeningBalance(supplier) + supplierCreditPurchasesTotal(supplier) - supplierPaymentsTotal(supplier));
+}
+// mirror of partyOpeningBalanceRemaining, for the Payable (Opening Balance)
+// reminder — only the payments pool left over after supplierLedgerRows'
+// FIFO allocation across credit purchases actually counts against it.
+function supplierOpeningBalanceRemaining(supplier){
+  const s = state.suppliers.find(x=>x.name===supplier);
+  if(!s || Number(s.openingBalance)<=0) return 0;
+  const poolUsed = supplierLedgerRows(supplier).filter(r=>!(r.purchase.type==='cash'||r.purchase.paid)).reduce((a,r)=>a+r.paid,0);
+  const poolLeftover = Math.max(0, supplierPaymentsTotal(supplier) - poolUsed);
+  return Math.max(0, Number(s.openingBalance) - poolLeftover);
 }
 // mirror of partyAdvanceBalance — payments beyond what's actually payable,
 // shown instead of silently vanishing. Already applies automatically
@@ -1990,16 +2015,20 @@ function reminderAlerts(){
   // same reminder treatment as a credit sale's recovery date, reported
   // against the opening-balance amount specifically (not the party's full
   // pending total, which may also include separately-reminded credit sales).
-  state.parties.filter(p=>p.dueDate && Number(p.openingBalance)>0 && partyPendingTotal(p.name)>0).forEach(p=>{
+  state.parties.filter(p=>p.dueDate && Number(p.openingBalance)>0).forEach(p=>{
+    const remaining = partyOpeningBalanceRemaining(p.name);
+    if(remaining<=0.009) return;
     const d = daysUntil(p.dueDate);
     if(d <= state.settings.creditReminderDays){
-      alerts.push({overdue:d<0, kind:'recoveryOpening', party:p.name, text:`Recovery (Opening Balance) — ${p.name}: Rs ${fmt(p.openingBalance)}, due ${fmtDate(p.dueDate)} ${d<0?`(${daysLabel(Math.abs(d))} overdue)`:`(${daysLabel(d)} left)`}`});
+      alerts.push({overdue:d<0, kind:'recoveryOpening', party:p.name, text:`Recovery (Opening Balance) — ${p.name}: Rs ${fmt(remaining)}, due ${fmtDate(p.dueDate)} ${d<0?`(${daysLabel(Math.abs(d))} overdue)`:`(${daysLabel(d)} left)`}`});
     }
   });
-  state.suppliers.filter(s=>s.dueDate && Number(s.openingBalance)>0 && supplierPendingTotal(s.name)>0).forEach(s=>{
+  state.suppliers.filter(s=>s.dueDate && Number(s.openingBalance)>0).forEach(s=>{
+    const remaining = supplierOpeningBalanceRemaining(s.name);
+    if(remaining<=0.009) return;
     const d = daysUntil(s.dueDate);
     if(d <= state.settings.creditReminderDays){
-      alerts.push({overdue:d<0, kind:'payableOpening', party:s.name, text:`Payable (Opening Balance) — ${s.name}: Rs ${fmt(s.openingBalance)}, due ${fmtDate(s.dueDate)} ${d<0?`(${daysLabel(Math.abs(d))} overdue)`:`(${daysLabel(d)} left)`}`});
+      alerts.push({overdue:d<0, kind:'payableOpening', party:s.name, text:`Payable (Opening Balance) — ${s.name}: Rs ${fmt(remaining)}, due ${fmtDate(s.dueDate)} ${d<0?`(${daysLabel(Math.abs(d))} overdue)`:`(${daysLabel(d)} left)`}`});
     }
   });
   // personal loans have no due date — they're meant to be cleared as soon as
@@ -2037,8 +2066,8 @@ function partyRecoverySummary(){
     if(outstanding<=0) return;
     add(s.party, outstanding, daysUntil(s.dueDate));
   });
-  state.parties.filter(p=>p.dueDate && Number(p.openingBalance)>0 && partyPendingTotal(p.name)>0).forEach(p=>{
-    add(p.name, Number(p.openingBalance), daysUntil(p.dueDate));
+  state.parties.filter(p=>p.dueDate && Number(p.openingBalance)>0).forEach(p=>{
+    add(p.name, partyOpeningBalanceRemaining(p.name), daysUntil(p.dueDate));
   });
   return Object.values(byParty)
     .filter(v=>v.overdue>0 || v.dueSoon>0)
@@ -2058,8 +2087,11 @@ function partyOverduePendingSplit(party){
     if(s.dueDate && daysUntil(s.dueDate)<0) overdue += outstanding; else pending += outstanding;
   });
   const p = state.parties.find(x=>x.name===party);
-  if(p && Number(p.openingBalance)>0 && partyPendingTotal(party)>0){
-    if(p.dueDate && daysUntil(p.dueDate)<0) overdue += Number(p.openingBalance); else pending += Number(p.openingBalance);
+  if(p && Number(p.openingBalance)>0){
+    const remaining = partyOpeningBalanceRemaining(party);
+    if(remaining>0.009){
+      if(p.dueDate && daysUntil(p.dueDate)<0) overdue += remaining; else pending += remaining;
+    }
   }
   return {overdue, pending};
 }
