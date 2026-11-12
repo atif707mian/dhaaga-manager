@@ -1774,6 +1774,12 @@ function partyCreditSalesTotal(party){
   return state.sales.filter(s=>s.party===party && s.type==='credit')
     .reduce((a,s)=>a+Math.max(0, Number(s.total)-saleCreditReturnsTotal(s.id)),0);
 }
+// plain headline total — every sale ever made to this party, cash and
+// credit combined, with no returns netted out (unlike partyCreditSalesTotal,
+// which only exists to feed the receivable/payable math above).
+function partyTotalSalesAll(party){
+  return state.sales.filter(s=>s.party===party && !s.staged).reduce((a,s)=>a+Number(s.total),0);
+}
 // opening balance is what this party already owed before using this app —
 // same principle as a bank account's opening_balance being the base that
 // later transactions build on top of.
@@ -3754,12 +3760,12 @@ function saleHistorySectionHtml(){
             ${filterVal==='__all__'?`<td>${escapeHtml(s.party)}</td>`:''}
             <td>${escapeHtml(s.item)}</td>
             <td>${fmtQtyPlain(s.qty)} ${escapeHtml(s.unit)}</td>
-            <td>Rs ${fmtQtyPlain(costPerUnit)}</td>
-            <td>Rs ${fmtQtyPlain(cost)}</td>
-            <td>Rs ${fmtQtyPlain(s.rate)}</td>
-            <td>Rs ${fmtQtyPlain(s.total)}</td>
-            <td>Rs ${fmtQtyPlain(s.profit||0)}</td>
-            <td>Rs ${fmtQtyPlain(netProfit(s))}${s.partnerId?` <span style="opacity:.6;font-size:11px;">(${Number(s.partnerPercent)||0}% to agent)</span>`:''}</td>
+            <td>Rs ${fmtPlain(costPerUnit)}</td>
+            <td>Rs ${fmtPlain(cost)}</td>
+            <td>Rs ${fmtPlain(s.rate)}</td>
+            <td>Rs ${fmtPlain(s.total)}</td>
+            <td>Rs ${fmtPlain(s.profit||0)}</td>
+            <td>Rs ${fmtPlain(netProfit(s))}${s.partnerId?` <span style="opacity:.6;font-size:11px;">(${Number(s.partnerPercent)||0}% to agent)</span>`:''}</td>
             <td>${profitPctMonthly(s).toFixed(1)}%${months?` <span style="opacity:.6;font-size:11px;">(${months.toFixed(1)} mo)</span>`:(s.type==='credit'?' <span style="opacity:.6;font-size:11px;">(no credit days set)</span>':' <span style="opacity:.6;font-size:11px;">(cash)</span>')}</td>
           </tr>`; }).join('') || `<tr><td colspan="${filterVal==='__all__'?11:10}" class="empty">No sales found</td></tr>`}
         </tbody>
@@ -3814,7 +3820,7 @@ function renderSales(main){
         <div><label>Unit</label><select id="s_unit"><option value="bags" ${(!editing||editing.unit==='bags')?'selected':''}>Bags</option><option value="kg" ${editing&&editing.unit==='kg'?'selected':''}>KG</option></select></div>
         <div id="s_batch_wrap" style="display:none;"><label>Purchase Batch (this sale's cost)</label><select id="s_batch" class="select-required"></select></div>
         <div><label>Rate per Unit</label><input type="number" id="s_rate" value="${editing?editing.rate:''}"></div>
-        <div><label>Bill / Total Amount</label><input id="s_total_display" value="${editing?fmtQtyPlain(Number(editing.qty)*Number(editing.rate)):''}" disabled></div>
+        <div><label>Bill / Total Amount</label><input id="s_total_display" value="${editing?fmtPlain(Number(editing.qty)*Number(editing.rate)):''}" disabled></div>
         <div><label>Payment Type</label>
           <select id="s_type"><option value="cash" ${editing&&editing.type==='cash'?'selected':''}>Cash</option><option value="credit" ${editing&&editing.type==='credit'?'selected':''}>Credit</option></select>
         </div>
@@ -3958,7 +3964,7 @@ function renderSales(main){
   const s_total_display = main.querySelector('#s_total_display');
   function updateSaleTotalDisplay(){
     const qty = Number(s_qty.value)||0, rate = Number(s_rate.value)||0;
-    s_total_display.value = (qty&&rate) ? fmtQtyPlain(qty*rate) : '';
+    s_total_display.value = (qty&&rate) ? fmtPlain(qty*rate) : '';
   }
   s_qty.addEventListener('input', updateSaleTotalDisplay);
   s_rate.addEventListener('input', updateSaleTotalDisplay);
@@ -4183,6 +4189,7 @@ function renderBuyerLedger(main, ro){
   const creditTotal = partyCreditSalesTotal(ledgerParty);
   const receivedTotal = partyReceiptsTotal(ledgerParty);
   const pending = partyPendingTotal(ledgerParty);
+  const { overdue: overdueSplit, pending: dueSoonSplit } = partyOverduePendingSplit(ledgerParty);
   const advance = partyAdvanceBalance(ledgerParty);
   const partyReceipts = applySortDir(state.receipts.filter(r=>r.party===ledgerParty).slice().sort(byRecencyDesc),'partyReceiptsHistory');
   main.innerHTML = `
@@ -4219,6 +4226,12 @@ function renderBuyerLedger(main, ro){
       <div class="settings-note" style="margin-top:8px;">${!fsApiSupported() ? 'Your browser doesn\'t support choosing a save folder, so downloads go to your default Downloads folder (use Chrome or Edge for folder selection).' : fsSavedDirName ? `Saving to folder: <b>${fsSavedDirName}</b> (same folder used for Trade Summary, Investor Summary and Books Balance Check) — each save gets its own time-stamped file. Use "Change Save Location" to pick a different folder.` : 'No folder chosen yet — the first save will ask where to save, then remember it.'}</div>
     </section>
     <div class="cards">
+      <div class="card"><div class="label">Total Payment</div><div class="value">Rs ${fmt(pending)}</div></div>
+      <div class="card" style="${overdueSplit>0.009?'background:#FEF2F2;border-color:#FECACA;':''}"><div class="label">Overdue Date</div><div class="value" style="${overdueSplit>0.009?'color:#991B1B;':''}">Rs ${fmt(overdueSplit)}</div></div>
+      <div class="card" style="${dueSoonSplit>0.009?'background:#FFFBEB;border-color:#FDE68A;':''}"><div class="label">Pending Payment</div><div class="value" style="${dueSoonSplit>0.009?'color:#92400E;':''}">Rs ${fmt(dueSoonSplit)}</div></div>
+    </div>
+    <div class="cards">
+      <div class="card"><div class="label">Total Sales (Cash + Credit)</div><div class="value">Rs ${fmt(partyTotalSalesAll(ledgerParty))}</div></div>
       <div class="card"><div class="label">Total Credit Sales</div><div class="value">Rs ${fmt(creditTotal)}</div></div>
       <div class="card"><div class="label">Total Received</div><div class="value">Rs ${fmt(receivedTotal)}</div></div>
       <div class="card ${pending>0?'warn':''}"><div class="label">Pending Balance</div><div class="value">Rs ${fmt(pending)}</div></div>
@@ -4241,7 +4254,16 @@ function renderBuyerLedger(main, ro){
             return `
             <tr><td>${fmtDate(r.sale.date)}</td><td>${r.sale.item}</td><td>${fmtQty(r.sale.qty)} ${r.sale.unit||'kg'}</td><td>Rs ${fmt(r.sale.total)}</td><td>${returned>0.009?'Rs '+fmt(returned):'—'}</td><td>Rs ${fmt(r.received)}</td><td>Rs ${fmt(r.effectiveTotal-r.received)}</td>
             <td>${r.status==='clear'?'<span class="pill ok">Clear</span>':r.status==='partial'?'<span class="pill partial">Partially Received</span>':(r.sale.type==='cash'?'<span class="pill cash">Cash</span>':'<span class="pill credit">Pending</span>')}</td>
-            <td>${r.sale.type==='credit'?fmtDate(r.sale.dueDate):'—'}</td></tr>`;}).join('') || `<tr><td colspan="9" class="empty">No sales for this party</td></tr>`}
+            <td>${r.sale.type==='credit'&&r.sale.dueDate?(()=>{
+              // same red/yellow language as the Dashboard's Reminders —
+              // only while this bill is still actually outstanding (Clear
+              // rows keep their due date plain, nothing left to chase).
+              if(r.status==='clear') return fmtDate(r.sale.dueDate);
+              const d = daysUntil(r.sale.dueDate);
+              if(d<0) return `<span style="background:#FEF2F2;color:#991B1B;padding:3px 8px;border-radius:6px;display:inline-block;">${fmtDate(r.sale.dueDate)}</span>`;
+              if(d<=state.settings.creditReminderDays) return `<span style="background:#FFFBEB;color:#92400E;padding:3px 8px;border-radius:6px;display:inline-block;">${fmtDate(r.sale.dueDate)}</span>`;
+              return fmtDate(r.sale.dueDate);
+            })():'—'}</td></tr>`;}).join('') || `<tr><td colspan="9" class="empty">No sales for this party</td></tr>`}
         </tbody>
       </table>
       </div>
@@ -4585,7 +4607,7 @@ function renderPurchases(main){
         <div><label>Quantity</label><input type="number" id="p_qty" value="${editing?editing.qty:''}"></div>
         <div><label>Unit</label><select id="p_unit"><option value="bags" ${(!editing||editing.unit==='bags')?'selected':''}>Bags</option><option value="kg" ${editing&&editing.unit==='kg'?'selected':''}>KG</option></select></div>
         <div><label>Rate per Unit</label><input type="number" id="p_rate" value="${editing?editing.rate:''}"></div>
-        <div><label>Bill / Total Amount</label><input id="p_total_display" value="${editing?fmtQtyPlain(Number(editing.qty)*Number(editing.rate)):''}" disabled></div>
+        <div><label>Bill / Total Amount</label><input id="p_total_display" value="${editing?fmtPlain(Number(editing.qty)*Number(editing.rate)):''}" disabled></div>
         <div><label>Payment Type</label>
           <select id="p_type"><option value="cash" ${editing&&editing.type==='cash'?'selected':''}>Cash</option><option value="credit" ${editing&&editing.type==='credit'?'selected':''}>Credit (pay later)</option></select>
         </div>
@@ -4724,7 +4746,7 @@ function renderPurchases(main){
   const p_total_display = main.querySelector('#p_total_display');
   function updatePurchaseTotalDisplay(){
     const qty = Number(p_qty.value)||0, rate = Number(p_rate.value)||0;
-    p_total_display.value = (qty&&rate) ? fmtQtyPlain(qty*rate) : '';
+    p_total_display.value = (qty&&rate) ? fmtPlain(qty*rate) : '';
   }
   p_qty.addEventListener('input', ()=>{ updatePurchaseTotalDisplay(); updatePurchaseFunding(); });
   p_rate.addEventListener('input', ()=>{ updatePurchaseTotalDisplay(); updatePurchaseFunding(); });
