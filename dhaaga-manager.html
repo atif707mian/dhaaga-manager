@@ -85,6 +85,13 @@
     padding:18px 20px;margin-bottom:16px;box-shadow:var(--shadow);}
   section.block h2{font-size:15.5px;margin:0 0 14px;color:var(--ink);font-weight:700;letter-spacing:.1px;}
   .form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:12px;margin-bottom:14px;}
+  .purchase-form-grid{row-gap:68px;}
+  .purchase-form-grid > div:has(> #p_total_display){position:relative;}
+  #p_round_note{position:absolute;top:100%;left:0;right:0;margin-top:6px !important;}
+  @media(max-width:860px){
+    .purchase-form-grid{row-gap:12px;}
+    #p_round_note{position:static;margin-top:6px !important;}
+  }
   /* a label long enough to wrap onto two lines (e.g. "Bank Name (cheque
      drawn on)") used to push its OWN input/select down below the row's
      other, single-line-label boxes — same grid row, but the box itself
@@ -287,6 +294,8 @@ let editingStockId = null;
 let masterTab = 'material'; // 'material' | 'supplier' | 'buyer' | 'history'
 let historyPartyFilter = '__all__';
 let financeTab = 'cheque'; // 'cheque' | 'payment' | 'transfer' — sub-tabs of the Financial Entry tab
+let chequeListViewBy = 'dueDate'; // 'dueDate' | 'entryDate' — Cheques List ordering
+let chequeListOrder = 'oldest'; // 'newest' | 'oldest' — direction for the selected cheque date
 let editingExpenseId = null;
 let auditFrom = '';
 let auditTo = '';
@@ -1897,10 +1906,17 @@ function creditPurchaseOutstanding(purchase){
 function payableDueTotal(){
   return supplierNames().reduce((a,s)=>a + supplierPendingTotal(s), 0);
 }
-// oldest-first: apply this party's total receipts against their credit sales
-// in date order, so each sale ends up "clear" / "partial" / "pending"
+// Due-date-first: apply this party's total receipts against credit sales
+// in due-date order (overdue dates first), then sale date for ties/missing
+// due dates, so each sale ends up "clear" / "partial" / "pending".
 function partyLedgerRows(party){
-  const sales = state.sales.filter(s=>s.party===party).slice().sort((a,b)=> (a.date<b.date?-1:a.date>b.date?1:0));
+  const sales = state.sales.filter(s=>s.party===party).slice().sort((a,b)=>{
+    const aDue = a.dueDate || '9999-12-31';
+    const bDue = b.dueDate || '9999-12-31';
+    if(aDue!==bDue) return aDue<bDue?-1:1;
+    if(a.date!==b.date) return a.date<b.date?-1:1;
+    return String(a.id||'').localeCompare(String(b.id||''));
+  });
   let pool = partyReceiptsTotal(party);
   return sales.map(s=>{
     // a cash sale never draws from the pool, so a return against one only
@@ -1913,6 +1929,36 @@ function partyLedgerRows(party){
     const status = total<=0.009 ? 'clear' : (applied<=0 ? 'pending' : (applied<total ? 'partial' : 'clear'));
     return {sale:s, received:applied, status, effectiveTotal:total};
   });
+}
+// Returns the date each credit sale was fully covered by receipts. Payments
+// are applied in the same due-date-first order as partyLedgerRows(), while
+// retaining receipt dates so the realized holding period can be measured.
+function partySalePaymentDates(party){
+  const sales = state.sales.filter(s=>s.party===party && s.type==='credit').slice().sort((a,b)=>{
+    const aDue = a.dueDate || '9999-12-31';
+    const bDue = b.dueDate || '9999-12-31';
+    if(aDue!==bDue) return aDue<bDue?-1:1;
+    if(a.date!==b.date) return a.date<b.date?-1:1;
+    return String(a.id||'').localeCompare(String(b.id||''));
+  }).map(s=>({sale:s, remaining:Math.max(0, Number(s.total)-saleCreditReturnsTotal(s.id))}));
+  const receipts = state.receipts.filter(r=>r.party===party).slice().sort((a,b)=>{
+    if(a.date!==b.date) return a.date<b.date?-1:1;
+    return String(a.id||'').localeCompare(String(b.id||''));
+  });
+  const paidDates = new Map();
+  let saleIndex = 0;
+  for(const receipt of receipts){
+    let amount = Number(receipt.amount)||0;
+    while(amount>0.009 && saleIndex<sales.length){
+      const row = sales[saleIndex];
+      if(row.remaining<=0.009){ saleIndex++; continue; }
+      const applied = Math.min(amount,row.remaining);
+      amount -= applied;
+      row.remaining -= applied;
+      if(row.remaining<=0.009){ paidDates.set(row.sale.id,receipt.date); saleIndex++; }
+    }
+  }
+  return paidDates;
 }
 // one party's full history as a single chronological statement — every
 // bill (sale) and every receipt interleaved in date order with a running
@@ -3719,9 +3765,12 @@ function wireBuyerSection(main){
 // uses), never recomputed here, so this can never drift from Reports/Dashboard.
 function saleHistorySectionHtml(){
   const allSales = state.sales.filter(s=>!s.staged);
-  const partyNames = Array.from(new Set(allSales.map(s=>s.party))).sort((a,b)=>a.localeCompare(b));
+  const partySales = state.sales.slice();
+  const partyNames = Array.from(new Set(partySales.map(s=>s.party))).sort((a,b)=>a.localeCompare(b));
   const filterVal = historyPartyFilter;
-  const filtered = filterVal==='__all__' ? allSales : allSales.filter(s=>s.party===filterVal);
+  // Keep the all-party overview as the recent live-sales view. A party filter
+  // is a full history lookup and must include Historical (staged) bills too.
+  const filtered = filterVal==='__all__' ? allSales : partySales.filter(s=>s.party===filterVal);
   const sorted = filtered.slice().sort(byRecencyDesc);
   const rows = applySortDir(filterVal==='__all__' ? sorted.slice(0,10) : sorted, 'saleHistory');
   const saleCost = s => Number(s.total) - Number(s.profit||0);
@@ -3757,6 +3806,23 @@ function saleHistorySectionHtml(){
     const raw = profitPctRaw(s);
     return (months && months>0) ? raw/months : raw;
   };
+  const paidDateBySale = new Map();
+  for(const party of new Set(partySales.map(s=>s.party))){
+    for(const [saleId,paidDate] of partySalePaymentDates(party)) paidDateBySale.set(saleId,paidDate);
+  }
+  const actualProfitPctMonthly = s => {
+    if(s.type!=='credit') return profitPctRaw(s);
+    const paidDate = paidDateBySale.get(s.id);
+    if(!paidDate || !s.date) return null;
+    const days = Math.max(0,Math.round((new Date(paidDate+'T00:00:00')-new Date(s.date+'T00:00:00'))/86400000));
+    const months = days/30;
+    return months>0 ? profitPctRaw(s)/months : profitPctRaw(s);
+  };
+  const ledgerBySale = new Map();
+  for(const party of new Set(partySales.map(s=>s.party))){
+    for(const row of partyLedgerRows(party)) ledgerBySale.set(row.sale.id,row);
+  }
+  const partyEntryRows = partySales.slice().sort((a,b)=>a.party.localeCompare(b.party)||(a.date<b.date?-1:a.date>b.date?1:String(a.id||'').localeCompare(String(b.id||''))));
   const summary = filterVal==='__all__' ? '' : (()=>{
     const totalSale = rows.reduce((a,s)=>a+Number(s.total),0);
     const totalCost = rows.reduce((a,s)=>a+saleCost(s),0);
@@ -3772,7 +3838,7 @@ function saleHistorySectionHtml(){
       <div class="card"><div class="label">Avg. Profit %/Month</div><div class="value-row"><div class="value">${avgMonthlyPct.toFixed(1)}%</div></div></div>
     </div>`;
   })();
-  return `
+  const detailSection = `
     <section class="block">
       <h2>Purchase/Sale — Sales Rate &amp; Profit History</h2>
       <div class="form-grid" style="margin-bottom:10px;">
@@ -3785,11 +3851,11 @@ function saleHistorySectionHtml(){
       ${sortToggleHtml('saleHistory')}
       <div style="overflow-x:auto;">
       <table>
-        <thead><tr><th>Date</th>${filterVal==='__all__'?'<th>Party</th>':''}<th>Item</th><th>Qty</th><th>Cost/Unit</th><th>Total Cost</th><th>Sale Rate</th><th>Sale Value</th><th>Gross Profit (Rs)</th><th>Net Profit (Rs)</th><th>Profit %/Month</th></tr></thead>
+        <thead><tr><th>Date</th>${filterVal==='__all__'?'<th>Party</th>':'<th>Entry Type</th>'}<th>Item</th><th>Qty</th><th>Cost/Unit</th><th>Total Cost</th><th>Sale Rate</th><th>Sale Value</th><th>Gross Profit (Rs)</th><th>Net Profit (Rs)</th><th>Profit %/Month</th><th>Profit %/Month After Payment</th></tr></thead>
         <tbody>
           ${rows.map(s=>{ const months = monthsForSale(s); const cost = saleCost(s); const costPerUnit = Number(s.qty)>0 ? cost/Number(s.qty) : 0; return `<tr>
             <td>${fmtDate(s.date)}</td>
-            ${filterVal==='__all__'?`<td>${escapeHtml(s.party)}</td>`:''}
+            ${filterVal==='__all__'?`<td>${escapeHtml(s.party)}</td>`:`<td>${s.staged?'Historical':'Current'}</td>`}
             <td>${escapeHtml(s.item)}</td>
             <td>${fmtQtyPlain(s.qty)} ${escapeHtml(s.unit)}</td>
             <td>Rs ${fmtPlain(costPerUnit)}</td>
@@ -3799,11 +3865,26 @@ function saleHistorySectionHtml(){
             <td>Rs ${fmtPlain(s.profit||0)}</td>
             <td>Rs ${fmtPlain(netProfit(s))}${s.partnerId?` <span style="opacity:.6;font-size:11px;">(${Number(s.partnerPercent)||0}% to agent)</span>`:''}</td>
             <td>${profitPctMonthly(s).toFixed(1)}%${months?` <span style="opacity:.6;font-size:11px;">(${months.toFixed(1)} mo)</span>`:(s.type==='credit'?' <span style="opacity:.6;font-size:11px;">(no credit days set)</span>':' <span style="opacity:.6;font-size:11px;">(cash)</span>')}</td>
-          </tr>`; }).join('') || `<tr><td colspan="${filterVal==='__all__'?11:10}" class="empty">No sales found</td></tr>`}
+            <td>${(()=>{ const actual=actualProfitPctMonthly(s); const paidDate=paidDateBySale.get(s.id); return actual===null?'Pending':`${actual.toFixed(1)}%${paidDate?` <span style="opacity:.6;font-size:11px;">(${fmtDate(paidDate)})</span>`:' <span style="opacity:.6;font-size:11px;">(cash)</span>'}`; })()}</td>
+          </tr>`; }).join('') || `<tr><td colspan="12" class="empty">No sales found</td></tr>`}
         </tbody>
       </table>
       </div>
-      <div class="settings-note" style="margin-top:10px;">Gross Profit = Sale Rate − this sale's Purchase Batch cost. Net Profit = Gross Profit minus just this sale's own Commission Agent share (if one is attached) — not the same deduction as the Dashboard's Trade Summary, which subtracts total commission across all sales only once, in aggregate. Profit %/Month = (Gross Profit ÷ Sale Value × 100) ÷ months the sale's credit was outstanding (Credit Days ÷ 30 — e.g. 90 days = 3 months, 45 days = 1.5 months). Cash sales have no credit period, so their profit % is shown as-is. Historical (staged) sales are excluded, same as elsewhere in Reports. "All Parties" shows only the most recent 10 entries; pick a specific party to see every sale made to them, along with their total cost and total profit.</div>
+      <div class="settings-note" style="margin-top:10px;">Gross Profit = Sale Rate − this sale's Purchase Batch cost. Net Profit = Gross Profit minus just this sale's own Commission Agent share (if one is attached) — not the same deduction as the Dashboard's Trade Summary, which subtracts total commission across all sales only once, in aggregate. Profit %/Month uses the expected credit period. Profit %/Month After Payment uses the actual days from sale to full receipt; it therefore reflects delays beyond the due date. Partial or unpaid credit sales show Pending until fully paid. Cash sales show their profit percentage as-is. "All Parties" shows only the 10 most recent live entries; selecting a specific party shows every bill, including Historical entries.</div>
+    </section>`;
+  return detailSection + `
+    <section class="block">
+      <h2>Party-wise Profit Ratio</h2>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>Party</th><th>Entry Type</th><th>Date</th><th>Due Date</th><th>Item</th><th>Previous Purchase Cost (Rs)</th><th>Bill Value (Rs)</th><th>Returned (Rs)</th><th>Gross Profit (Rs)</th><th>Received (Rs)</th><th>Outstanding (Rs)</th><th>Status</th><th>Paid Date</th><th>Profit %/Month at Bill</th><th>Profit %/Month After Receiving</th></tr></thead>
+          <tbody>${partyEntryRows.map(s=>{ const actual=actualProfitPctMonthly(s), paidDate=s.type==='cash'?s.date:paidDateBySale.get(s.id), ledgerRow=ledgerBySale.get(s.id), received=Number(ledgerRow?.received)||0, effectiveTotal=ledgerRow?Number(ledgerRow.effectiveTotal):Number(s.total)||0; return `<tr>
+            <td>${escapeHtml(s.party)}</td><td>${s.staged?'Historical':'Current'}</td><td>${fmtDate(s.date)}</td><td>${s.dueDate?fmtDate(s.dueDate):'—'}</td><td>${escapeHtml(s.item)}</td><td>Rs ${fmtPlain(saleCost(s))}</td><td>Rs ${fmtPlain(s.total)}</td><td>Rs ${fmtPlain(Math.max(0,Number(s.total)-effectiveTotal))}</td><td>Rs ${fmtPlain(s.profit||0)}</td><td>Rs ${fmtPlain(received)}</td><td>Rs ${fmtPlain(Math.max(0,effectiveTotal-received))}</td><td>${ledgerRow?.status==='clear'?'Clear':ledgerRow?.status==='partial'?'Partially Received':'Pending'}</td><td>${paidDate?fmtDate(paidDate):'—'}</td>
+            <td>${profitPctMonthly(s).toFixed(1)}%</td><td>${actual===null?'Pending':`${actual.toFixed(1)}%`}</td>
+          </tr>`; }).join('') || '<tr><td colspan="15" class="empty">No party sales found</td></tr>'}</tbody>
+        </table>
+      </div>
+      <div class="settings-note" style="margin-top:10px;">Every sale is listed separately under its party, including Historical entries (the report above continues to exclude them). Received, Outstanding and Status match the Party Ledger's allocation. Purchase Cost and Gross Profit come from the sale's recorded purchase-batch cost. Profit %/Month at Bill uses the expected credit period. After Receiving uses the actual days from sale to full receipt; unpaid or partially paid credit sales remain Pending until fully settled.</div>
     </section>`;
 }
 function wireSaleHistorySection(main){
@@ -4632,14 +4713,22 @@ function renderPurchases(main){
     <section class="block">
       <h2>${editing?'Edit Purchase Entry':'New Purchase Entry'}</h2>
       ${(!editing && state.settings.setupMode) ? `<div class="settings-note" style="margin-bottom:10px;">Historical Data Entry Mode is ON — this purchase will be saved as <b>Historical</b>: no unit-mismatch check, and it will <b>never</b> count toward Stock, Cash, Bank, or Profit (this is permanent, not just while the mode is on). It <b>does</b> count immediately and permanently toward the Supplier Ledger and Payable Due if it's Credit (set a Due Date on the Supplier's own record in Master Record for reminders).</div>` : ''}
-      <div class="form-grid">
+      <div class="form-grid purchase-form-grid">
         <div><label>Date</label><input type="date" id="p_date" value="${editing?editing.date:todayStr()}"></div>
         <div><label>Supplier / Mill Name</label><input id="p_supplier" value="${editing?editing.supplier:''}"></div>
         <div><label>Yarn Type / Count</label><input id="p_item" placeholder="e.g. 30s Acrylic / Grey" value="${editing?editing.item:''}"></div>
         <div><label>Quantity</label><input type="number" id="p_qty" value="${editing?editing.qty:''}"></div>
         <div><label>Unit</label><select id="p_unit"><option value="bags" ${(!editing||editing.unit==='bags')?'selected':''}>Bags</option><option value="kg" ${editing&&editing.unit==='kg'?'selected':''}>KG</option></select></div>
         <div><label>Rate per Unit</label><input type="number" id="p_rate" value="${editing?editing.rate:''}"></div>
-        <div><label>Bill / Total Amount</label><input id="p_total_display" value="${editing?fmtPlain(Number(editing.qty)*Number(editing.rate)):''}" disabled></div>
+        <div>
+          <div style="display:flex;gap:6px;margin-bottom:6px;">
+            <button type="button" class="btn nav" id="p_round_down" style="flex:1;padding:6px 5px;font-size:11px;">− Round Down</button>
+            <button type="button" class="btn nav" id="p_round_up" style="flex:1;padding:6px 5px;font-size:11px;">+ Round Up</button>
+          </div>
+          <label>Bill / Total Amount</label>
+          <input id="p_total_display" value="${editing?fmtPlain(Number(editing.total)):''}" readonly>
+          <div class="settings-note" id="p_round_note" style="margin-top:6px;padding:6px 8px;"></div>
+        </div>
         <div><label>Payment Type</label>
           <select id="p_type"><option value="cash" ${editing&&editing.type==='cash'?'selected':''}>Cash</option><option value="credit" ${editing&&editing.type==='credit'?'selected':''}>Credit (pay later)</option></select>
         </div>
@@ -4776,12 +4865,40 @@ function renderPurchases(main){
   const p_qty = main.querySelector('#p_qty');
   const p_rate = main.querySelector('#p_rate');
   const p_total_display = main.querySelector('#p_total_display');
+  let purchaseTotalOverride = editing ? Number(editing.total) : null;
+  function purchaseRawTotal(){ return (Number(p_qty.value)||0) * (Number(p_rate.value)||0); }
+  function purchaseBillTotal(){ return purchaseTotalOverride===null ? purchaseRawTotal() : purchaseTotalOverride; }
   function updatePurchaseTotalDisplay(){
-    const qty = Number(p_qty.value)||0, rate = Number(p_rate.value)||0;
-    p_total_display.value = (qty&&rate) ? fmtPlain(qty*rate) : '';
+    const raw = purchaseRawTotal(), total = purchaseBillTotal();
+    p_total_display.value = raw ? fmtPlain(total) : '';
+    const adjustment = total-raw;
+    const note = main.querySelector('#p_round_note');
+    note.replaceChildren();
+    if(Math.abs(adjustment)>0.009){
+      note.style.display='flex';
+      note.style.alignItems='center';
+      note.style.justifyContent='space-between';
+      const text = document.createElement('span');
+      text.textContent = `${adjustment>0?'+':'−'}Rs ${fmtPlain(Math.abs(adjustment))} applied here`;
+      const reset = document.createElement('button');
+      reset.type='button'; reset.className='btn danger'; reset.textContent='Use Raw';
+      reset.style.cssText='margin-left:6px;white-space:nowrap;';
+      reset.onclick=()=>{ purchaseTotalOverride=null; updatePurchaseTotalDisplay(); updatePurchaseFunding(); };
+      note.append(text, reset);
+    } else {
+      note.style.display='block';
+      note.textContent='No round-off adjustment';
+    }
   }
-  p_qty.addEventListener('input', ()=>{ updatePurchaseTotalDisplay(); updatePurchaseFunding(); });
-  p_rate.addEventListener('input', ()=>{ updatePurchaseTotalDisplay(); updatePurchaseFunding(); });
+  function applyPurchaseRounding(direction){
+    const raw = purchaseRawTotal();
+    if(!raw) return;
+    const rounded = (direction==='down' ? Math.floor(raw/100) : Math.ceil(raw/100))*100;
+    if(rounded<=0){ showAlert('This amount would round to Rs 0. Choose Round Up or enter a higher amount.'); return; }
+    purchaseTotalOverride=rounded;
+    updatePurchaseTotalDisplay();
+    updatePurchaseFunding();
+  }
   // available balance for THIS account, treating the purchase being edited
   // (if any, and if it already drew cash from this same account) as not yet
   // spent — otherwise editing a cash purchase would double-count its own
@@ -4791,9 +4908,14 @@ function renderPurchases(main){
   }
   const updatePurchaseFunding = wireShortfallCover(main, 'p',
     ()=>main.querySelector('#p_account').value,
-    ()=>main.querySelector('#p_type').value==='cash' ? (Number(p_qty.value)||0)*(Number(p_rate.value)||0) : 0,
+    ()=>main.querySelector('#p_type').value==='cash' ? purchaseBillTotal() : 0,
     purchaseAvailable
   );
+  p_qty.addEventListener('input', ()=>{ purchaseTotalOverride=null; updatePurchaseTotalDisplay(); updatePurchaseFunding(); });
+  p_rate.addEventListener('input', ()=>{ purchaseTotalOverride=null; updatePurchaseTotalDisplay(); updatePurchaseFunding(); });
+  main.querySelector('#p_round_down').onclick = ()=>applyPurchaseRounding('down');
+  main.querySelector('#p_round_up').onclick = ()=>applyPurchaseRounding('up');
+  updatePurchaseTotalDisplay();
   main.querySelector('#p_account').addEventListener('change', updatePurchaseFunding);
   main.querySelector('#p_type').onchange = (e)=>{
     main.querySelector('#p_acc_wrap').style.display = e.target.value==='credit' ? 'none':'flex';
@@ -4806,12 +4928,13 @@ function renderPurchases(main){
       rate=Number(main.querySelector('#p_rate').value), type=main.querySelector('#p_type').value,
       account=main.querySelector('#p_account').value;
     if(!supplier||!item||!qty||!rate){ await showAlert('Please fill all required fields'); return; }
+    const total = purchaseBillTotal();
     let funding = null;
     if(type==='cash'){
-      funding = await resolveShortfallMulti({ date, account, total: qty*rate, getAvailable: purchaseAvailable, prefix:'p', main });
+      funding = await resolveShortfallMulti({ date, account, total, getAvailable: purchaseAvailable, prefix:'p', main });
       if(!funding) return;
     }
-    const body = {date, supplier, item, qty, unit, rate, type, account};
+    const body = {date, supplier, item, qty, unit, rate, total, type, account};
     // funding links only make sense on creation — an edit's own shortfall
     // (if any) isn't this purchase's original funding story.
     if(funding && !editing){ body.fundingTransferIds = funding.transferIds; body.fundingLoanIds = funding.loanIds; }
@@ -5060,11 +5183,33 @@ function chequeEntrySectionHtml(ro){
     </section>`}
     <section class="block">
       <h2>Cheques List</h2>
+      <div style="display:flex;align-items:center;gap:10px;margin:0 0 12px;">
+        <label for="cheque_list_view" style="margin:0;color:var(--muted);font-size:14px;">View by</label>
+        <select id="cheque_list_view" style="width:auto;min-width:190px;">
+          <option value="dueDate" ${chequeListViewBy==='dueDate'?'selected':''}>Due date</option>
+          <option value="entryDate" ${chequeListViewBy==='entryDate'?'selected':''}>Entry date</option>
+        </select>
+        <button type="button" class="btn nav" id="cheque_newest_first" aria-pressed="${chequeListOrder==='newest'}" style="background:${chequeListOrder==='newest'?'#3f6342':'#607a61'};padding:10px 18px;">Newest First</button>
+        <button type="button" class="btn nav" id="cheque_oldest_first" aria-pressed="${chequeListOrder==='oldest'}" style="background:${chequeListOrder==='oldest'?'#3f6342':'#607a61'};padding:10px 18px;">Oldest First</button>
+      </div>
       <div style="overflow-x:auto;">
       <table>
         <thead><tr><th>Date</th><th>Direction</th><th>Party</th><th>Bank</th><th>Amount</th><th>Due Date</th><th>Status</th>${ro?'':'<th></th>'}</tr></thead>
         <tbody>
-          ${state.cheques.slice().sort((a,b)=> (a.dueDate<b.dueDate?-1:a.dueDate>b.dueDate?1:0)).map(c=>{
+          ${state.cheques.slice().sort((a,b)=>{
+            // Keep unresolved cheques first; order both groups by the selected
+            // date and direction. Cleared cheques stay at the end.
+            if(a.status!==b.status) return a.status==='pending' ? -1 : 1;
+            const field = chequeListViewBy==='entryDate' ? 'date' : 'dueDate';
+            const byDate = (a[field]||'').localeCompare(b[field]||'') * (chequeListOrder==='newest' ? -1 : 1);
+            if(byDate) return byDate;
+            if(a.status==='cleared'){
+              const clearTime = (b.updatedAt||'').localeCompare(a.updatedAt||'');
+              if(clearTime) return clearTime;
+            }
+            const byDueDate = (a.dueDate||'').localeCompare(b.dueDate||'') * (chequeListOrder==='newest' ? -1 : 1);
+            return byDueDate || (a.id||'').localeCompare(b.id||'');
+          }).map(c=>{
             // same overdue/due-soon row coloring as "Clear a Pending Cheque"
             // (Financial Entry → Payment) — only for still-Pending cheques,
             // since a Cleared one is already resolved and due-date no
@@ -5091,6 +5236,9 @@ function chequeEntrySectionHtml(ro){
   `;
 }
 function wireChequeEntrySection(main){
+  main.querySelector('#cheque_list_view').onchange = (e)=>{ chequeListViewBy=e.target.value; render(); };
+  main.querySelector('#cheque_newest_first').onclick = ()=>{ chequeListOrder='newest'; render(); };
+  main.querySelector('#cheque_oldest_first').onclick = ()=>{ chequeListOrder='oldest'; render(); };
   const form = main.querySelector('.form-grid').closest('section');
   const c_direction = main.querySelector('#c_direction');
   attachCombo(main.querySelector('#c_party'), ()=> c_direction.value==='issued' ? supplierNames() : partyNames(), form);

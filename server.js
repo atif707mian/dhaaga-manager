@@ -756,6 +756,15 @@ async function ensureSchema() {
     ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS staged BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS funding_transfer_ids TEXT;
     ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS funding_loan_ids TEXT;
+    -- A cleared cheque may create only one cash movement. The cheque_id
+    -- columns plus partial unique indexes make that invariant durable even
+    -- if two clear requests arrive concurrently or a client retries.
+    ALTER TABLE receipts ADD COLUMN IF NOT EXISTS cheque_id TEXT;
+    ALTER TABLE supplier_payments ADD COLUMN IF NOT EXISTS cheque_id TEXT;
+    CREATE UNIQUE INDEX IF NOT EXISTS receipts_one_per_cheque
+      ON receipts (client_id, cheque_id) WHERE cheque_id IS NOT NULL;
+    CREATE UNIQUE INDEX IF NOT EXISTS supplier_payments_one_per_cheque
+      ON supplier_payments (client_id, cheque_id) WHERE cheque_id IS NOT NULL;
     CREATE TABLE IF NOT EXISTS payouts (
       id TEXT PRIMARY KEY, date DATE NOT NULL,
       recipient_type TEXT NOT NULL CHECK (recipient_type IN ('investor','partner')),
@@ -772,7 +781,7 @@ async function ensureSchema() {
       before JSONB, after JSONB, entry JSONB
     );
     ALTER TABLE audit_log DROP CONSTRAINT IF EXISTS audit_log_kind_check;
-    ALTER TABLE audit_log ADD CONSTRAINT audit_log_kind_check CHECK (kind IN ('sale','purchase','investor','partner','bank','expense','cheque','receipt','payout','user','party','stock','supplier','supplier_payment','transfer','personal_loan','purchase_return','sale_return','purchase_advance','misc_income'));
+    ALTER TABLE audit_log ADD CONSTRAINT audit_log_kind_check CHECK (kind IN ('sale','purchase','investor','partner','bank','expense','cheque','receipt','payout','user','party','stock','supplier','supplier_payment','transfer','personal_loan','purchase_return','sale_return','purchase_advance','misc_income')) NOT VALID;
     ALTER TABLE audit_log DROP CONSTRAINT IF EXISTS audit_log_action_check;
     ALTER TABLE audit_log ADD CONSTRAINT audit_log_action_check CHECK (action IN ('edit','delete','undo-clear'));
 
@@ -1127,12 +1136,12 @@ async function assertFundsAvailable(db, clientId, accId, amount) {
     throw e;
   }
 }
-// mirrors the frontend's partyLedgerRows() FIFO pooling (party's full
-// receipts total, applied oldest-credit-sale-first) so a per-sale delete
-// check agrees with what the Ledger already shows for that sale.
+// mirrors the frontend's partyLedgerRows() pooling (party's full receipts
+// total, applied earliest-due-credit-sale-first) so a per-sale delete check
+// agrees with what the Ledger already shows for that sale.
 async function partySaleFifoAppliedDb(db, clientId, party, saleId) {
   const salesRes = await db.query(
-    'SELECT id, type, total FROM sales WHERE client_id=$1 AND party=$2 ORDER BY date, id',
+    'SELECT id, type, total, due_date FROM sales WHERE client_id=$1 AND party=$2 ORDER BY due_date ASC NULLS LAST, date ASC, id ASC',
     [clientId, party]
   );
   const receiptsRes = await db.query(
@@ -1239,6 +1248,19 @@ function isPositiveAmount(v) {
 function isNonNegativeAmount(v) {
   const n = Number(v);
   return Number.isFinite(n) && n >= 0 && n < MAX_SANE_AMOUNT;
+}
+function purchaseTotalFromInput(qty, rate, requestedTotal) {
+  const calculated = Number(qty) * Number(rate);
+  if (requestedTotal === undefined || requestedTotal === null || requestedTotal === '') return calculated;
+  const total = Number(requestedTotal);
+  const roundedDown = Math.floor(calculated / 100) * 100;
+  const roundedUp = Math.ceil(calculated / 100) * 100;
+  if (!isPositiveAmount(total) || [calculated, roundedDown, roundedUp].every(allowed => Math.abs(total - allowed) > 0.009)) {
+    const e = new Error('Purchase total must equal quantity × rate or that amount rounded up or down to Rs 100.');
+    e.code = 'INVALID_PURCHASE_TOTAL';
+    throw e;
+  }
+  return total;
 }
 function parseIdList(raw) {
   if (!raw) return [];
@@ -2094,7 +2116,7 @@ app.post('/api/purchases', ...editorAccess, async (req, res) => {
           }
         }
       }
-      const total = Number(x.qty) * Number(x.rate);
+      const total = purchaseTotalFromInput(x.qty, x.rate, x.total);
       const id = crypto.randomUUID();
       const r = await db.query(
         `INSERT INTO purchases (id,client_id,date,supplier,item,qty,unit,rate,total,type,account_id,paid,staged,funding_transfer_ids,funding_loan_ids)
@@ -2113,7 +2135,7 @@ app.post('/api/purchases', ...editorAccess, async (req, res) => {
     });
     res.json(mapPurchase(row));
   } catch (err) {
-    if (err.code === 'UNIT_MISMATCH' || err.code === 'NEGATIVE_STOCK') return res.status(400).json({ error: err.message });
+    if (err.code === 'UNIT_MISMATCH' || err.code === 'NEGATIVE_STOCK' || err.code === 'INVALID_PURCHASE_TOTAL') return res.status(400).json({ error: err.message });
     console.error('POST /api/purchases error:', err);
     res.status(500).json({ error: 'Unable to add purchase' });
   }
@@ -2162,7 +2184,16 @@ app.patch('/api/purchases/:id', ...editorAccess, async (req, res) => {
           throw e;
         }
       }
-      const total = Number(x.qty) * Number(x.rate);
+      const total = purchaseTotalFromInput(x.qty, x.rate, x.total);
+      if (returnedQty > 0.001) {
+        const oldRoundOff = Number(old.total) - Number(old.qty) * Number(old.rate);
+        const newRoundOff = total - Number(x.qty) * Number(x.rate);
+        if (Math.abs(newRoundOff - oldRoundOff) > 0.009) {
+          const e = new Error('This purchase has a Purchase Return recorded against it — remove that return before changing its round-off amount.');
+          e.code = 'NEGATIVE_STOCK';
+          throw e;
+        }
+      }
       const r = await db.query(
         `UPDATE purchases SET date=$1,supplier=$2,item=$3,qty=$4,unit=$5,rate=$6,total=$7,type=$8,account_id=$9,updated_at=now()
          WHERE id=$10 AND client_id=$11 RETURNING *`,
@@ -2185,7 +2216,7 @@ app.patch('/api/purchases/:id', ...editorAccess, async (req, res) => {
     if (!row) return res.status(404).json({ error: 'Purchase not found' });
     res.json(mapPurchase(row));
   } catch (err) {
-    if (err.code === 'UNIT_MISMATCH' || err.code === 'NEGATIVE_STOCK') return res.status(400).json({ error: err.message });
+    if (err.code === 'UNIT_MISMATCH' || err.code === 'NEGATIVE_STOCK' || err.code === 'INVALID_PURCHASE_TOTAL') return res.status(400).json({ error: err.message });
     console.error('PATCH /api/purchases/:id error:', err);
     res.status(500).json({ error: 'Unable to update purchase' });
   }
@@ -2335,7 +2366,8 @@ app.post('/api/purchase-returns', ...editorAccess, async (req, res) => {
       const salesReturnedQty = saleIds.length
         ? Number((await db.query('SELECT COALESCE(SUM(qty),0) s FROM sales_returns WHERE sale_id = ANY($1::text[])', [saleIds])).rows[0].s)
         : 0;
-      const alreadyReturned = Number((await db.query('SELECT COALESCE(SUM(qty),0) s FROM purchase_returns WHERE purchase_id=$1', [x.purchaseId])).rows[0].s);
+      const priorReturns = (await db.query('SELECT qty,total FROM purchase_returns WHERE purchase_id=$1', [x.purchaseId])).rows;
+      const alreadyReturned = priorReturns.reduce((sum, r) => sum + Number(r.qty), 0);
       const returnable = Number(purchase.qty) - soldQty + salesReturnedQty - alreadyReturned;
       if (Number(x.qty) > returnable + 0.001) {
         const e = new Error(`Only ${returnable} ${purchase.unit} from this purchase can still be returned (${soldQty - salesReturnedQty} already sold, ${alreadyReturned} already returned).`);
@@ -2343,7 +2375,13 @@ app.post('/api/purchase-returns', ...editorAccess, async (req, res) => {
         throw e;
       }
       const rate = Number(purchase.rate);
-      const total = Number(x.qty) * rate;
+      const fullRoundOff = Number(purchase.total) - Number(purchase.qty) * rate;
+      const priorRoundOff = priorReturns.reduce((sum, r) => sum + Number(r.total) - Number(r.qty) * rate, 0);
+      const remainingRoundOff = fullRoundOff - priorRoundOff;
+      const roundOffShare = alreadyReturned + Number(x.qty) >= Number(purchase.qty) - 0.001
+        ? remainingRoundOff
+        : Number((fullRoundOff * Number(x.qty) / Number(purchase.qty)).toFixed(2));
+      const total = Number((Number(x.qty) * rate + roundOffShare).toFixed(2));
       // QA Round 24, Item 1: a Refund on a credit purchase increased the
       // bank AND reduced the payable, double-counting the same money —
       // mirrors QA Round 23's Item 3 fix on the sales side exactly. Cap
@@ -2559,9 +2597,17 @@ app.post('/api/cheques/:id/clear', ...editorAccess, async (req, res) => {
   const x = req.body || {};
   try {
     const row = await withTenantDb(req.clientId, async (db) => {
-      const c = await db.query('SELECT * FROM cheques WHERE id=$1 AND client_id=$2', [req.params.id, req.clientId]);
+      // Lock the cheque row inside this request's transaction. Without this,
+      // two simultaneous Mark Cleared requests can both see Pending and each
+      // insert a cash movement before either updates the cheque.
+      const c = await db.query('SELECT * FROM cheques WHERE id=$1 AND client_id=$2 FOR UPDATE', [req.params.id, req.clientId]);
       if (!c.rows[0]) return null;
       const cheque = c.rows[0];
+      if (cheque.status !== 'pending' || cheque.receipt_id || cheque.payment_id) {
+        const e = new Error('This cheque has already been cleared. No second payment or receipt was created.');
+        e.code = 'ALREADY_CLEARED';
+        throw e;
+      }
       // defensive: POST/PATCH /api/cheques already reject a non-positive
       // amount at entry, but clearing is the step that actually moves real
       // money, so double-check the stored value too — in case of old data
@@ -2584,32 +2630,43 @@ app.post('/api/cheques/:id/clear', ...editorAccess, async (req, res) => {
         // afford this — link it to the payment this clear creates, or
         // deleting this payment (or the cheque itself) later leaves that
         // transfer behind as a permanent orphan.
-        await db.query('INSERT INTO supplier_payments (id,client_id,date,supplier,amount,account_id,note,funding_transfer_ids,funding_loan_ids) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)', [
+        await db.query('INSERT INTO supplier_payments (id,client_id,date,supplier,amount,account_id,note,funding_transfer_ids,funding_loan_ids,cheque_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)', [
           paymentId, req.clientId, today, cheque.party, cheque.amount, account,
           `Cheque cleared${cheque.bank ? ' (' + cheque.bank + ')' : ''}`,
-          fundingIdsJson(x.fundingTransferIds), fundingIdsJson(x.fundingLoanIds)
+          fundingIdsJson(x.fundingTransferIds), fundingIdsJson(x.fundingLoanIds), cheque.id
         ]);
         const r = await db.query(
-          "UPDATE cheques SET status='cleared', payment_id=$1, account_id=$2 WHERE id=$3 AND client_id=$4 RETURNING *",
+          "UPDATE cheques SET status='cleared', payment_id=$1, account_id=$2, updated_at=now() WHERE id=$3 AND client_id=$4 AND status='pending' AND payment_id IS NULL AND receipt_id IS NULL RETURNING *",
           [paymentId, account, req.params.id, req.clientId]
         );
+        if (!r.rows[0]) {
+          const e = new Error('This cheque has already been cleared. No second payment or receipt was created.');
+          e.code = 'ALREADY_CLEARED';
+          throw e;
+        }
         return r.rows[0];
       }
       const receiptId = crypto.randomUUID();
-      await db.query('INSERT INTO receipts (id,client_id,date,party,amount,account_id,note) VALUES ($1,$2,$3,$4,$5,$6,$7)', [
+      await db.query('INSERT INTO receipts (id,client_id,date,party,amount,account_id,note,cheque_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)', [
         receiptId, req.clientId, today, cheque.party, cheque.amount, account,
-        `Cheque cleared${cheque.bank ? ' (' + cheque.bank + ')' : ''}`
+        `Cheque cleared${cheque.bank ? ' (' + cheque.bank + ')' : ''}`, cheque.id
       ]);
       const r = await db.query(
-        "UPDATE cheques SET status='cleared', receipt_id=$1, account_id=$2 WHERE id=$3 AND client_id=$4 RETURNING *",
+        "UPDATE cheques SET status='cleared', receipt_id=$1, account_id=$2, updated_at=now() WHERE id=$3 AND client_id=$4 AND status='pending' AND payment_id IS NULL AND receipt_id IS NULL RETURNING *",
         [receiptId, account, req.params.id, req.clientId]
       );
+      if (!r.rows[0]) {
+        const e = new Error('This cheque has already been cleared. No second payment or receipt was created.');
+        e.code = 'ALREADY_CLEARED';
+        throw e;
+      }
       return r.rows[0];
     });
     if (!row) return res.status(404).json({ error: 'Cheque not found' });
     res.json(mapCheque(row));
   } catch (err) {
     if (err.code === 'INSUFFICIENT_FUNDS') return res.status(400).json({ error: err.message });
+    if (err.code === 'ALREADY_CLEARED') return res.status(409).json({ error: err.message });
     console.error('POST /api/cheques/:id/clear error:', err);
     res.status(500).json({ error: 'Unable to clear cheque' });
   }
